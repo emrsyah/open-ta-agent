@@ -1,149 +1,135 @@
 """
-Paper retriever service for searching and retrieving papers.
+Paper retriever service for searching and retrieving papers from database.
+Uses PostgreSQL with SQLAlchemy for async queries.
 """
 
-import json
-import os
-from typing import List
-from app.core.models import Paper, PaperResult
-from app.config import get_settings
+from typing import List, Optional
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.models import PaperResult
+from app.db.crud import CatalogCRUD
+from app.db.models import Catalog
 
 
 class PaperRetriever:
     """
-    Simple keyword-based paper retriever.
+    Database-backed paper retriever using PostgreSQL.
     
-    TODO: Replace with vector search implementation using:
+    Replaces the mock data with real catalog data from Supabase.
+    Supports keyword search with relevance scoring.
+    
+    TODO: Add vector search implementation:
     - dspy.retrievers.Embeddings for semantic search
     - Hybrid approach: BM25 on title + vector on abstract
     """
     
-    def __init__(self, papers: List[Paper] | None = None):
+    def __init__(self, db_session: Optional[AsyncSession] = None):
         """
-        Initialize retriever with paper data.
+        Initialize retriever.
         
         Args:
-            papers: List of papers, or None to load from file
+            db_session: Async database session (can be set later)
         """
-        if papers:
-            self.papers = papers
-        else:
-            self.papers = self._load_papers()
+        self.db_session = db_session
+        self._crud: Optional[CatalogCRUD] = None
+        self._papers_cache: List[PaperResult] = []
     
-    def _load_papers(self) -> List[Paper]:
-        """Load papers from JSON file or use defaults."""
-        settings = get_settings()
-        data_path = settings.PAPERS_DATA_PATH
-        
-        if os.path.exists(data_path):
-            with open(data_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                return [Paper(**p) for p in data]
-        
-        # Return default mock data
-        return self._get_default_papers()
+    def set_session(self, db_session: AsyncSession):
+        """Set the database session (called during app startup)."""
+        self.db_session = db_session
+        self._crud = CatalogCRUD(db_session)
     
-    def _get_default_papers(self) -> List[Paper]:
-        """Default Telkom-themed papers for testing."""
-        return [
-            Paper(
-                id="paper_001",
-                title="Deep Learning Approaches for Natural Language Processing",
-                authors=["Dr. Ahmad Rizky", "Dr. Siti Nurhaliza"],
-                abstract="This paper explores various deep learning techniques including transformers and BERT for NLP tasks. We evaluate performance on Indonesian language datasets.",
-                year=2023,
-                keywords=["deep learning", "NLP", "transformers"]
-            ),
-            Paper(
-                id="paper_002",
-                title="Machine Learning Applications in Telecommunications",
-                authors=["Prof. Budi Santoso", "Dr. Maya Sari"],
-                abstract="A comprehensive study on applying machine learning algorithms to optimize network traffic and predict system failures in telecom infrastructure.",
-                year=2024,
-                keywords=["machine learning", "telecom", "optimization"]
-            ),
-            Paper(
-                id="paper_003",
-                title="Computer Vision for Smart Cities",
-                authors=["Dr. Dedi Kurniawan"],
-                abstract="Implementation of computer vision algorithms for traffic monitoring, pedestrian detection, and smart surveillance systems in urban environments.",
-                year=2023,
-                keywords=["computer vision", "smart city", "AI"]
-            ),
-            Paper(
-                id="paper_004",
-                title="Blockchain Technology in Supply Chain Management",
-                authors=["Dr. Eko Prasetyo", "Dr. Fitriani", "Rizal Maulana"],
-                abstract="This research investigates the application of blockchain technology to improve transparency and traceability in supply chain management systems.",
-                year=2024,
-                keywords=["blockchain", "supply chain"]
-            ),
-            Paper(
-                id="paper_005",
-                title="IoT Security: Challenges and Solutions",
-                authors=["Dr. Gita Permata"],
-                abstract="An analysis of security vulnerabilities in IoT devices and proposed cryptographic solutions to protect against common attack vectors.",
-                year=2022,
-                keywords=["IoT", "security", "cryptography"]
-            ),
-        ]
+    def _catalog_to_paper(self, catalog: Catalog, relevance_score: float = 0.0) -> PaperResult:
+        """Convert database Catalog model to PaperResult API model."""
+        return PaperResult(
+            id=f"catalog_{catalog.id}",
+            title=catalog.title,
+            authors=catalog.author.split(", ") if catalog.author else ["Unknown"],
+            abstract=catalog.subject or "No abstract available",
+            year=catalog.publication_year or 0,
+            keywords=[catalog.catalog_type] if catalog.catalog_type else [],
+            relevance_score=relevance_score
+        )
     
-    def search(
+    async def search(
         self,
         query: str,
         limit: int = 5,
-        search_field: str = "all"
+        search_field: str = "all",
+        catalog_type: Optional[str] = None,
+        year_from: Optional[int] = None,
+        year_to: Optional[int] = None
     ) -> List[PaperResult]:
         """
-        Search papers by keyword.
+        Search papers in database by keyword.
         
         Args:
             query: Search query
             limit: Maximum results
-            search_field: Which field to search ('all', 'title', 'abstract', 'authors')
+            search_field: Which field to search ('all', 'title', 'subject', 'author')
+            catalog_type: Filter by catalog type
+            year_from: Filter by minimum year
+            year_to: Filter by maximum year
             
         Returns:
             List of papers with relevance scores
         """
+        if not self._crud:
+            # Fallback to cache if no database
+            return self._search_cache(query, limit)
+        
+        # Map search fields
+        field_mapping = {
+            "all": ["title", "author", "subject"],
+            "title": ["title"],
+            "abstract": ["subject"],  # Drizzle schema uses 'subject' not 'abstract'
+            "authors": ["author"],
+            "subject": ["subject"],
+        }
+        search_fields = field_mapping.get(search_field, field_mapping["all"])
+        
+        # Query database
+        results, _ = await self._crud.search(
+            query=query,
+            search_fields=search_fields,
+            catalog_type=catalog_type,
+            year_from=year_from,
+            year_to=year_to,
+            limit=limit,
+            offset=0
+        )
+        
+        # Convert to PaperResult
+        papers = []
+        for catalog, score in results:
+            paper = self._catalog_to_paper(catalog, relevance_score=score)
+            papers.append(paper)
+        
+        return papers
+    
+    def _search_cache(self, query: str, limit: int) -> List[PaperResult]:
+        """Search in cached papers (fallback when DB unavailable)."""
         query_lower = query.lower()
         query_words = query_lower.split()
         matches = []
         
-        for paper in self.papers:
+        for paper in self._papers_cache:
             score = 0
+            title_lower = paper.title.lower()
             
-            # Check title (higher weight)
-            if search_field in ("all", "title"):
-                title_lower = paper.title.lower()
-                if any(word in title_lower for word in query_words):
-                    score += 3
-                if query_lower in title_lower:
-                    score += 5  # Exact match bonus
-            
-            # Check abstract
-            if search_field in ("all", "abstract"):
-                abstract_lower = paper.abstract.lower()
-                if any(word in abstract_lower for word in query_words):
-                    score += 1
-                if query_lower in abstract_lower:
-                    score += 2
-            
-            # Check authors
-            if search_field in ("all", "authors"):
-                authors_text = " ".join(paper.authors).lower()
-                if any(word in authors_text for word in query_words):
-                    score += 2
+            if any(word in title_lower for word in query_words):
+                score += 3
+            if query_lower in title_lower:
+                score += 5
             
             if score > 0:
                 paper_dict = paper.model_dump()
                 paper_dict["relevance_score"] = score
                 matches.append((score, PaperResult(**paper_dict)))
         
-        # Sort by relevance and return top results
         matches.sort(key=lambda x: x[0], reverse=True)
         return [paper for _, paper in matches[:limit]]
     
-    def get_context(self, query: str, top_k: int = 3) -> str:
+    async def get_context(self, query: str, top_k: int = 3) -> str:
         """
         Get formatted context string for RAG.
         
@@ -154,10 +140,10 @@ class PaperRetriever:
         Returns:
             Formatted context string
         """
-        papers = self.search(query, limit=top_k)
+        papers = await self.search(query, limit=top_k)
         
         if not papers:
-            return "No relevant papers found."
+            return "No relevant papers found in the catalog."
         
         context_parts = []
         for i, paper in enumerate(papers, 1):
@@ -171,13 +157,50 @@ class PaperRetriever:
         
         return "\n---\n".join(context_parts)
     
-    def get_all_papers(self) -> List[Paper]:
-        """Return all papers."""
-        return self.papers
+    async def get_all_papers(self, limit: int = 100) -> List[PaperResult]:
+        """Return all papers from database."""
+        if not self._crud:
+            return self._papers_cache
+        
+        catalogs, _ = await self._crud.get_all(limit=limit, offset=0)
+        return [self._catalog_to_paper(c) for c in catalogs]
     
-    def get_paper_by_id(self, paper_id: str) -> Paper | None:
+    async def get_paper_by_id(self, paper_id: str) -> Optional[PaperResult]:
         """Get a single paper by ID."""
-        for paper in self.papers:
-            if paper.id == paper_id:
-                return paper
+        # Extract numeric ID from "catalog_X"
+        try:
+            catalog_id = int(paper_id.replace("catalog_", ""))
+        except ValueError:
+            return None
+        
+        if not self._crud:
+            # Search in cache
+            for paper in self._papers_cache:
+                if paper.id == paper_id:
+                    return paper
+            return None
+        
+        catalog = await self._crud.get_by_id(catalog_id)
+        if catalog:
+            return self._catalog_to_paper(catalog)
         return None
+    
+    async def get_by_catalog_type(
+        self, 
+        catalog_type: str, 
+        limit: int = 100
+    ) -> List[PaperResult]:
+        """Get papers by catalog type (e.g., 'skripsi', 'ePoster')."""
+        if not self._crud:
+            return []
+        
+        catalogs = await self._crud.get_by_catalog_type(catalog_type, limit)
+        return [self._catalog_to_paper(c) for c in catalogs]
+    
+    async def get_by_year(self, year: int, limit: int = 100) -> List[PaperResult]:
+        """Get papers from a specific publication year."""
+        if not self._crud:
+            return []
+        
+        catalogs = await self._crud.get_recent_by_year(year, limit)
+        return [self._catalog_to_paper(c) for c in catalogs]

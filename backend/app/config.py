@@ -5,7 +5,19 @@ Uses pydantic-settings for environment variable management.
 
 from pydantic_settings import BaseSettings
 from functools import lru_cache
-from typing import Optional
+from typing import Optional, List
+
+
+def parse_cors_origins(v: str) -> List[str]:
+    """Parse CORS origins from comma-separated string."""
+    if not v:
+        return [
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:5500",
+            "http://localhost:5500",
+        ]
+    return [origin.strip() for origin in v.split(",")]
 
 
 class Settings(BaseSettings):
@@ -33,13 +45,8 @@ class Settings(BaseSettings):
     APP_VERSION: str = "1.0.0"
     APP_DESCRIPTION: str = "AI-powered paper research platform for Telkom University"
     
-    # CORS Configuration
-    CORS_ORIGINS: list[str] = [
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5500",
-        "http://localhost:5500",
-    ]
+    # CORS Configuration (comma-separated in .env, e.g., "http://localhost:3000,http://localhost:5173")
+    CORS_ORIGINS_STR: Optional[str] = None
     
     # Server Configuration
     HOST: str = "0.0.0.0"
@@ -48,6 +55,25 @@ class Settings(BaseSettings):
     
     # Data Configuration
     PAPERS_DATA_PATH: str = "data/papers.json"
+    
+    @property
+    def CORS_ORIGINS(self) -> List[str]:
+        """Get CORS origins as list."""
+        return parse_cors_origins(self.CORS_ORIGINS_STR or "")
+    
+    # Database Configuration (Supabase PostgreSQL)
+    DATABASE_URL: Optional[str] = None
+    DATABASE_HOST: Optional[str] = None
+    DATABASE_PORT: int = 5432
+    DATABASE_NAME: Optional[str] = None
+    DATABASE_USER: Optional[str] = None
+    DATABASE_PASSWORD: Optional[str] = None
+    
+    # Database Pool Settings
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 10
+    DB_POOL_TIMEOUT: int = 30
+    DB_POOL_RECYCLE: int = 1800
     
     class Config:
         env_file = ".env"
@@ -67,6 +93,19 @@ class Settings(BaseSettings):
     def is_openrouter(self) -> bool:
         """Check if using OpenRouter."""
         return self.OPENROUTER_API_KEY is not None
+    
+    def get_database_url(self) -> str:
+        """Get database URL (construct from parts if full URL not provided)."""
+        if self.DATABASE_URL:
+            return self.DATABASE_URL
+        
+        if all([self.DATABASE_HOST, self.DATABASE_NAME, self.DATABASE_USER, self.DATABASE_PASSWORD]):
+            return f"postgresql+asyncpg://{self.DATABASE_USER}:{self.DATABASE_PASSWORD}@{self.DATABASE_HOST}:{self.DATABASE_PORT}/{self.DATABASE_NAME}"
+        
+        raise ValueError(
+            "Database not configured. Set DATABASE_URL or all of: "
+            "DATABASE_HOST, DATABASE_NAME, DATABASE_USER, DATABASE_PASSWORD"
+        )
 
 
 @lru_cache()

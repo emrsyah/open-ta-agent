@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from app.config import get_settings
+from app.database import get_session_factory, close_db, get_engine
 from app.api.routes import chat, papers, health
 from app.services.rag import init_rag_service
 from app.services.retriever import PaperRetriever
@@ -42,17 +43,65 @@ async def lifespan(app: FastAPI):
     
     dspy.configure(lm=lm, async_max_workers=settings.DSPY_MAX_WORKERS)
     
-    # Initialize services
-    retriever = PaperRetriever()
-    init_rag_service(retriever)
-    
-    print(f"✅ {settings.APP_NAME} v{settings.APP_VERSION} started")
-    print(f"📚 Loaded {len(retriever.get_all_papers())} papers")
+    # Initialize database connection and services
+    db_session = None
+    try:
+        # Try to initialize database
+        session_factory = get_session_factory()
+        
+        if session_factory is not None:
+            # Create a database session for the retriever
+            db_session = session_factory()
+            retriever = PaperRetriever()
+            retriever.set_session(db_session)
+            
+            # Store retriever in app state for dependency injection
+            app.state.retriever = retriever
+            app.state.db_session = db_session
+            
+            init_rag_service(retriever)
+            
+            # Get paper count from database
+            all_papers = await retriever.get_all_papers(limit=1000)
+            paper_count = len(all_papers)
+            
+            # Close the session - it will be recreated per-request
+            await db_session.close()
+            db_session = None
+            
+            print(f"✅ {settings.APP_NAME} v{settings.APP_VERSION} started")
+            print(f"🗄️  Database connected")
+            print(f"📚 Loaded {paper_count} papers from database")
+        else:
+            # Database not configured
+            print("⚠️  Database not configured")
+            print("📚 Using mock data (set DATABASE_URL in .env to use real database)")
+            retriever = PaperRetriever()
+            init_rag_service(retriever)
+            app.state.retriever = retriever
+        
+    except Exception as e:
+        print(f"⚠️  Database connection failed: {e}")
+        print("📚 Falling back to mock data")
+        if db_session:
+            await db_session.close()
+        retriever = PaperRetriever()
+        init_rag_service(retriever)
+        app.state.retriever = retriever
     
     yield
     
     # Shutdown
     print("👋 Shutting down...")
+    
+    # Close database connections
+    try:
+        if hasattr(app.state, 'db_session'):
+            await app.state.db_session.close()
+        await close_db()
+        print("🗄️  Database connections closed")
+    except Exception as e:
+        print(f"⚠️  Error closing database: {e}")
 
 
 def create_app() -> FastAPI:
@@ -92,12 +141,20 @@ if __name__ == "__main__":
     
     settings = get_settings()
     
+    # Check if database is configured
+    try:
+        settings.get_database_url()
+        db_status = "🗄️  Database: Configured"
+    except ValueError:
+        db_status = "⚠️  Database: Not configured"
+    
     print(f"""
     ╔══════════════════════════════════════════════════════════╗
     ║            {settings.APP_NAME:<42} ║
     ╠══════════════════════════════════════════════════════════╣
     ║                                                          ║
     ║  🚀 Running at: http://{settings.HOST}:{settings.PORT:<4}                    ║
+    ║  {db_status:<54}║
     ║                                                          ║
     ║  Available Endpoints:                                    ║
     ║    GET  /health              - Health check              ║

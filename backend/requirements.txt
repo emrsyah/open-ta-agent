@@ -17,3 +17,11 @@ orjson
 
 # Environment Variables
 python-dotenv
+
+# Database (PostgreSQL via Supabase)
+sqlalchemy[asyncio]
+asyncpg
+alembic
+
+# Database Connection Pooling
+psycopg2-binary
