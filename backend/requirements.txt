@@ -1,12 +1,13 @@
-# Paper Research Platform - Minimal Setup
-# FastAPI + DSPy + OpenRouter
+# Paper Research Platform - FastAPI + DSPy Backend
+# Telkom University Paper Research API
 
 # Web Framework
 fastapi
-uvicorn[standard]
+uvicorn
 
 # Data Validation
 pydantic
+pydantic-settings
 
 # AI Framework
 dspy-ai
@@ -14,5 +15,5 @@ dspy-ai
 # JSON Processing (faster than standard json)
 orjson
 
-# Environment Variables (optional but recommended)
+# Environment Variables
 python-dotenv
