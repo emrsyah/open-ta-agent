@@ -1,0 +1,36 @@
+# DSPy + FastAPI Paper Research Platform
+# Core dependencies for streaming AI chat backend
+
+# FastAPI & Web Framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# DSPy & AI
+dspy-ai>=2.5.0
+openai>=1.0.0
+
+# Data Processing
+orjson>=3.9.0
+numpy>=1.24.0
+
+# Vector Search (if using local embeddings)
+sentence-transformers>=2.2.0
+faiss-cpu>=1.7.0  # or faiss-gpu for GPU
+
+# Environment Variables
+python-dotenv>=1.0.0
+
+# Optional: Redis for session history
+redis>=5.0.0
+
+# Optional: Database for paper metadata
+sqlalchemy>=2.0.0
+asyncpg>=0.29.0  # PostgreSQL
+# or
+# aiosqlite>=0.19.0  # SQLite
+
+# Development
+pytest>=7.4.0
+httpx>=0.25.0  # For testing async endpoints

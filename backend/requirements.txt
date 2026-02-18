@@ -1,0 +1,18 @@
+# Paper Research Platform - Minimal Setup
+# FastAPI + DSPy + OpenRouter
+
+# Web Framework
+fastapi
+uvicorn[standard]
+
+# Data Validation
+pydantic
+
+# AI Framework
+dspy-ai
+
+# JSON Processing (faster than standard json)
+orjson
+
+# Environment Variables (optional but recommended)
+python-dotenv
