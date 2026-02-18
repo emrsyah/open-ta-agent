@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -24,7 +25,7 @@
         .container {
             background: white;
             border-radius: 16px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
             width: 100%;
             max-width: 800px;
             height: 90vh;
@@ -118,12 +119,25 @@
             animation: bounce 1.4s infinite ease-in-out both;
         }
 
-        .typing span:nth-child(1) { animation-delay: -0.32s; }
-        .typing span:nth-child(2) { animation-delay: -0.16s; }
+        .typing span:nth-child(1) {
+            animation-delay: -0.32s;
+        }
+
+        .typing span:nth-child(2) {
+            animation-delay: -0.16s;
+        }
 
         @keyframes bounce {
-            0%, 80%, 100% { transform: scale(0); }
-            40% { transform: scale(1); }
+
+            0%,
+            80%,
+            100% {
+                transform: scale(0);
+            }
+
+            40% {
+                transform: scale(1);
+            }
         }
 
         .input-area {
@@ -222,6 +236,7 @@
         }
     </style>
 </head>
+
 <body>
     <div class="container">
         <div class="header">
@@ -238,7 +253,8 @@
             <div class="message assistant">
                 <div class="message-sender">AI Assistant</div>
                 <div class="message-content">
-                    Hello! I'm your AI research assistant. Ask me anything about the papers in the catalog. You can also search papers above.
+                    Hello! I'm your AI research assistant. Ask me anything about the papers in the catalog. You can also
+                    search papers above.
                 </div>
             </div>
         </div>
@@ -248,7 +264,7 @@
                 <input type="text" class="chat-input" id="userInput" placeholder="Ask about research papers...">
                 <button class="send-btn" id="sendBtn">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
+                        <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" />
                     </svg>
                 </button>
             </div>
@@ -269,20 +285,20 @@
         function addMessage(role, content, sources = null) {
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${role}`;
-            
+
             let html = `
                 <div class="message-sender">${role === 'user' ? 'You' : 'AI Assistant'}</div>
                 <div class="message-content">${content}</div>
             `;
-            
+
             if (sources && sources.length > 0) {
                 html += `<div class="sources">📄 Sources: ${sources.join(', ')}</div>`;
             }
-            
+
             messageDiv.innerHTML = html;
             messagesContainer.appendChild(messageDiv);
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
-            
+
             return messageDiv;
         }
 
@@ -310,7 +326,7 @@
         // Stream AI response
         async function streamResponse(question) {
             try {
-                const response = await fetch(`${API_URL}/chat`, {
+                const response = await fetch(`${API_URL}/chat/basic`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ question, stream: true })
@@ -320,7 +336,7 @@
 
                 const reader = response.body.getReader();
                 const decoder = new TextDecoder();
-                
+
                 let assistantMessage = null;
                 let fullContent = '';
                 let sources = null;
@@ -341,17 +357,17 @@
 
                             try {
                                 const parsed = JSON.parse(data);
-                                
+
                                 if (parsed.type === 'token') {
                                     fullContent += parsed.content;
-                                    
+
                                     if (!assistantMessage) {
                                         assistantMessage = addMessage('assistant', '');
                                     }
-                                    
+
                                     assistantMessage.querySelector('.message-content').textContent = fullContent;
                                     messagesContainer.scrollTop = messagesContainer.scrollHeight;
-                                
+
                                 } else if (parsed.type === 'done') {
                                     if (parsed.sources) {
                                         sources = parsed.sources;
@@ -384,9 +400,9 @@
             try {
                 const response = await fetch(`${API_URL}/search?query=${encodeURIComponent(query)}`);
                 const data = await response.json();
-                
+
                 papersList.innerHTML = '';
-                
+
                 if (data.results.length === 0) {
                     papersList.innerHTML = '<div class="paper-item">No papers found</div>';
                     return;
@@ -430,7 +446,7 @@
 
         // Event listeners
         sendBtn.addEventListener('click', sendMessage);
-        
+
         userInput.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') sendMessage();
         });
@@ -445,4 +461,5 @@
         userInput.focus();
     </script>
 </body>
+
 </html>

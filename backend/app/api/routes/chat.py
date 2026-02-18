@@ -40,14 +40,18 @@ async def chat_basic(request: ChatRequest):
         return ChatResponse(
             answer=result["answer"],
             sources=result["sources"],
-            context=result.get("rationale")
+            context=result.get("rationale"),
+            search_query=result.get("search_query")
         )
     
     # Streaming response via SSE
     rag_module = rag_service.get_module()
+    retriever = rag_service.get_retriever()
+    query_generator = rag_service.query_generator
+    cheap_lm = rag_service.cheap_lm
     
     return StreamingResponse(
-        stream_dspy_response(rag_module, question=request.question),
+        stream_dspy_response(rag_module, retriever, question=request.question, query_generator=query_generator, cheap_lm=cheap_lm),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

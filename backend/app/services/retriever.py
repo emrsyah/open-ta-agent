@@ -3,11 +3,14 @@ Paper retriever service for searching and retrieving papers from database.
 Uses PostgreSQL with SQLAlchemy for async queries.
 """
 
+import logging
 from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.models import PaperResult
 from app.db.crud import CatalogCRUD
 from app.db.models import Catalog
+
+logger = logging.getLogger(__name__)
 
 
 class PaperRetriever:
@@ -73,8 +76,10 @@ class PaperRetriever:
         Returns:
             List of papers with relevance scores
         """
+        logger.info(f"[RETRIEVER] Searching for query: '{query}' with limit={limit}, field={search_field}")
+        
         if not self._crud:
-            # Fallback to cache if no database
+            logger.warning("[RETRIEVER] No CRUD available, falling back to cache search")
             return self._search_cache(query, limit)
         
         # Map search fields
@@ -86,24 +91,32 @@ class PaperRetriever:
             "subject": ["subject"],
         }
         search_fields = field_mapping.get(search_field, field_mapping["all"])
+        logger.info(f"[RETRIEVER] Search fields: {search_fields}")
         
         # Query database
-        results, _ = await self._crud.search(
-            query=query,
-            search_fields=search_fields,
-            catalog_type=catalog_type,
-            year_from=year_from,
-            year_to=year_to,
-            limit=limit,
-            offset=0
-        )
+        try:
+            results, total = await self._crud.search(
+                query=query,
+                search_fields=search_fields,
+                catalog_type=catalog_type,
+                year_from=year_from,
+                year_to=year_to,
+                limit=limit,
+                offset=0
+            )
+            logger.info(f"[RETRIEVER] DB returned {len(results)} results (total: {total})")
+        except Exception as e:
+            logger.error(f"[RETRIEVER] Error during DB search: {e}", exc_info=True)
+            raise
         
         # Convert to PaperResult
         papers = []
         for catalog, score in results:
             paper = self._catalog_to_paper(catalog, relevance_score=score)
             papers.append(paper)
+            logger.debug(f"[RETRIEVER] Result: {paper.title} (score: {score})")
         
+        logger.info(f"[RETRIEVER] Returning {len(papers)} papers")
         return papers
     
     def _search_cache(self, query: str, limit: int) -> List[PaperResult]:
@@ -140,9 +153,11 @@ class PaperRetriever:
         Returns:
             Formatted context string
         """
+        logger.info(f"[RETRIEVER] Getting context for query: '{query}' (top_k={top_k})")
         papers = await self.search(query, limit=top_k)
         
         if not papers:
+            logger.warning(f"[RETRIEVER] No papers found for query: '{query}'")
             return "No relevant papers found in the catalog."
         
         context_parts = []
@@ -155,7 +170,10 @@ class PaperRetriever:
                 f"Abstract: {paper.abstract}\n"
             )
         
-        return "\n---\n".join(context_parts)
+        context = "\n---\n".join(context_parts)
+        logger.info(f"[RETRIEVER] Built context with {len(papers)} papers (length: {len(context)} chars)")
+        logger.debug(f"[RETRIEVER] Context preview: {context[:200]}...")
+        return context
     
     async def get_all_papers(self, limit: int = 100) -> List[PaperResult]:
         """Return all papers from database."""

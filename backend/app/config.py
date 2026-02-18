@@ -31,8 +31,17 @@ class Settings(BaseSettings):
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     
     # DSPy / LLM Configuration
+    # Main model (high quality, for answer generation)
     DSPY_MODEL: str = "openrouter/google/gemini-2.5-pro-preview"
     DSPY_FALLBACK_MODEL: str = "openai/gpt-4o-mini"
+    
+    # Cheap model (fast/cost-effective, for query generation and simple tasks)
+    DSPY_CHEAP_MODEL: str = "openrouter/openai/gpt-4o-mini"
+    # Alternative cheap options:
+    # - "openrouter/meta-llama/llama-3.2-3b-instruct" (very cheap)
+    # - "openrouter/google/gemini-flash-1.5" (fast)
+    # - "openrouter/nvidia/llama-3.1-nemotron-70b-instruct:free" (free tier)
+    
     DSPY_MAX_WORKERS: int = 4
     
     # Retrieval Configuration

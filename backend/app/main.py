@@ -25,23 +25,42 @@ async def lifespan(app: FastAPI):
     # Startup
     settings = get_settings()
     
-    # Configure DSPy
+    # Configure DSPy with dual models
     if settings.is_openrouter():
         print("🚀 Using OpenRouter API")
-        lm = dspy.LM(
+        # Main model for high-quality answer generation
+        main_lm = dspy.LM(
             settings.DSPY_MODEL,
             api_base=settings.OPENROUTER_BASE_URL,
             api_key=settings.get_api_key(),
             model_type="chat"
         )
+        # Cheap model for query generation and simple tasks
+        cheap_lm = dspy.LM(
+            settings.DSPY_CHEAP_MODEL,
+            api_base=settings.OPENROUTER_BASE_URL,
+            api_key=settings.get_api_key(),
+            model_type="chat"
+        )
+        print(f"   Main model: {settings.DSPY_MODEL}")
+        print(f"   Cheap model: {settings.DSPY_CHEAP_MODEL}")
     else:
         print("🔑 Using OpenAI API")
-        lm = dspy.LM(
+        main_lm = dspy.LM(
             settings.DSPY_FALLBACK_MODEL,
             api_key=settings.get_api_key()
         )
+        cheap_lm = dspy.LM(
+            "gpt-3.5-turbo",  # Cheap fallback
+            api_key=settings.get_api_key()
+        )
     
-    dspy.configure(lm=lm, async_max_workers=settings.DSPY_MAX_WORKERS)
+    # Configure default LM (main model)
+    dspy.configure(lm=main_lm, async_max_workers=settings.DSPY_MAX_WORKERS)
+    
+    # Store both models in app state
+    app.state.main_lm = main_lm
+    app.state.cheap_lm = cheap_lm
     
     # Initialize database connection and services
     db_session = None
@@ -59,7 +78,7 @@ async def lifespan(app: FastAPI):
             app.state.retriever = retriever
             app.state.db_session = db_session
             
-            init_rag_service(retriever)
+            init_rag_service(retriever, cheap_lm=cheap_lm)
             
             # Get paper count from database
             all_papers = await retriever.get_all_papers(limit=1000)
@@ -77,7 +96,7 @@ async def lifespan(app: FastAPI):
             print("⚠️  Database not configured")
             print("📚 Using mock data (set DATABASE_URL in .env to use real database)")
             retriever = PaperRetriever()
-            init_rag_service(retriever)
+            init_rag_service(retriever, cheap_lm=cheap_lm)
             app.state.retriever = retriever
         
     except Exception as e:
@@ -86,7 +105,7 @@ async def lifespan(app: FastAPI):
         if db_session:
             await db_session.close()
         retriever = PaperRetriever()
-        init_rag_service(retriever)
+        init_rag_service(retriever, cheap_lm=cheap_lm)
         app.state.retriever = retriever
     
     yield

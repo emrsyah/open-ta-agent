@@ -2,13 +2,16 @@
 CRUD operations for Catalog model.
 """
 
+import logging
 from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_, and_, text
+from sqlalchemy import select, func, or_, and_, text, case
 from sqlalchemy.orm import selectinload
 
 from app.db.models import Catalog, CatalogType
 from app.db.schemas import CatalogCreate, CatalogUpdate, CatalogFilterRequest
+
+logger = logging.getLogger(__name__)
 
 
 class CatalogCRUD:
@@ -152,11 +155,15 @@ class CatalogCRUD:
                     func.lower(field_mapping[field]).like(query_lower)
                 )
         
+        logger.info(f"[CRUD] Search params: query='{query}', fields={search_fields}, limit={limit}")
+        logger.debug(f"[CRUD] Search conditions: {len(search_conditions)} conditions, query_lower='{query_lower}'")
+        
         # Build base query
         base_query = select(Catalog)
         
         if search_conditions:
             base_query = base_query.where(or_(*search_conditions))
+            logger.debug(f"[CRUD] Added search conditions to query")
         
         # Add filters
         filters = []
@@ -165,7 +172,9 @@ class CatalogCRUD:
             try:
                 cat_type_enum = CatalogType(catalog_type)
                 filters.append(Catalog.catalog_type == cat_type_enum)
+                logger.debug(f"[CRUD] Added catalog_type filter: {catalog_type}")
             except ValueError:
+                logger.warning(f"[CRUD] Invalid catalog_type: {catalog_type}")
                 pass
         
         if year_from is not None:
@@ -177,25 +186,27 @@ class CatalogCRUD:
         if filters:
             base_query = base_query.where(and_(*filters))
         
-        # Get total count
-        count_query = select(func.count(Catalog.id)).select_from(base_query.subquery())
+        # Get total count - count from the subquery
+        count_query = select(func.count()).select_from(base_query.subquery())
+        logger.debug(f"[CRUD] Executing count query...")
         count_result = await self.session.execute(count_query)
-        total = count_result.scalar()
+        total = count_result.scalar() or 0
+        logger.info(f"[CRUD] Total matching records: {total}")
         
         # Calculate relevance score using full-text search ranking
         # Higher score if match in title, then author, then subject
         score_expr = func.coalesce(
-            func.case(
+            case(
                 (func.lower(Catalog.title).like(query_lower), 3.0),
                 else_=0.0
             ), 0.0
         ) + func.coalesce(
-            func.case(
+            case(
                 (func.lower(Catalog.author).like(query_lower), 2.0),
                 else_=0.0
             ), 0.0
         ) + func.coalesce(
-            func.case(
+            case(
                 (func.lower(Catalog.subject).like(query_lower), 1.0),
                 else_=0.0
             ), 0.0
@@ -206,8 +217,15 @@ class CatalogCRUD:
         query_with_score = query_with_score.order_by(score_expr.desc(), Catalog.id.desc())
         query_with_score = query_with_score.offset(offset).limit(limit)
         
+        logger.debug(f"[CRUD] Executing final query with scoring...")
         result = await self.session.execute(query_with_score)
         rows = result.all()
+        logger.info(f"[CRUD] Query returned {len(rows)} rows")
+        
+        for i, row in enumerate(rows[:3]):  # Log first 3 results
+            catalog = row[0]
+            score = row[1]
+            logger.debug(f"[CRUD] Result {i+1}: '{catalog.title}' (score: {score})")
         
         return [(row[0], float(row[1])) for row in rows], total
     

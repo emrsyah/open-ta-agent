@@ -76,6 +76,7 @@ class ChatResponse(BaseModel):
     answer: str = Field(..., description="Generated answer")
     sources: List[str] = Field(default_factory=list, description="Referenced paper IDs")
     context: Optional[str] = Field(default=None, description="Retrieved context")
+    search_query: Optional[str] = Field(default=None, description="Generated search query used for retrieval")
 
 
 class StreamChunk(BaseModel):
