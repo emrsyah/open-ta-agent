@@ -93,7 +93,7 @@ class Settings(BaseSettings):
     # Retrieval Config
     RETRIEVAL_TOP_K: int = 5
     EMBEDDING_MODEL: str = "openai/text-embedding-3-small"
-    EMBEDDING_DIM: int = 512
+    EMBEDDING_DIM: int = 1024
     
     # App Config
     APP_NAME: str = "Telkom Paper Research API"
@@ -158,7 +158,7 @@ class PaperRetriever:
         self.papers = papers
         self.embedder = embedder or dspy.Embedder(
             'openai/text-embedding-3-small',
-            dimensions=512
+            dimensions=1024
         )
         
         # Build corpus from abstracts

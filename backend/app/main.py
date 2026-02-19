@@ -81,7 +81,7 @@ async def lifespan(app: FastAPI):
             init_rag_service(retriever, cheap_lm=cheap_lm)
             
             # Get paper count from database
-            all_papers = await retriever.get_all_papers(limit=1000)
+            all_papers = await retriever.get_all_papers(limit=10)
             paper_count = len(all_papers)
             
             # Close the session - it will be recreated per-request

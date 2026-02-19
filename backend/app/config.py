@@ -26,13 +26,14 @@ class Settings(BaseSettings):
     # API Keys (at least one required)
     OPENROUTER_API_KEY: Optional[str] = None
     OPENAI_API_KEY: Optional[str] = None
+    VOYAGE_API_KEY: Optional[str] = None
     
     # OpenRouter Configuration
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     
     # DSPy / LLM Configuration
     # Main model (high quality, for answer generation)
-    DSPY_MODEL: str = "openrouter/google/gemini-2.5-pro-preview"
+    DSPY_MODEL: str = "openrouter/google/gemini-2.5-flash-lite"
     DSPY_FALLBACK_MODEL: str = "openai/gpt-4o-mini"
     
     # Cheap model (fast/cost-effective, for query generation and simple tasks)
@@ -46,8 +47,8 @@ class Settings(BaseSettings):
     
     # Retrieval Configuration
     RETRIEVAL_TOP_K: int = 3
-    EMBEDDING_MODEL: str = "openai/text-embedding-3-small"
-    EMBEDDING_DIM: int = 512
+    EMBEDDING_MODEL: str = "voyage-4-lite"
+    EMBEDDING_DIM: int = 1024
     
     # Application Configuration
     APP_NAME: str = "Telkom Paper Research API"
@@ -88,6 +89,7 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
         case_sensitive = True
+        extra = "ignore"
     
     def get_api_key(self) -> str:
         """Get the primary API key (OpenRouter preferred)."""

@@ -55,6 +55,9 @@ cp .env.example .env
 ### 3. Run the Server
 
 ```bash
+# Activate virtual environment
+.venv\Scripts\activate
+
 # Option 1: Using run.py
 python run.py
 

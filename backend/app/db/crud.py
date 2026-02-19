@@ -120,6 +120,51 @@ class CatalogCRUD:
         await self.session.commit()
         return True
     
+    async def vector_search(
+        self,
+        embedding: List[float],
+        limit: int = 10,
+        catalog_type: Optional[str] = None,
+        year_from: Optional[int] = None,
+        year_to: Optional[int] = None
+    ) -> List[tuple[Catalog, float]]:
+        """
+        Search catalogs using vector similarity (cosine distance).
+        Returns list of (catalog, score) tuples.
+        """
+        # Calculate cosine similarity: 1 - cosine_distance
+        # <=> is the operator for cosine distance in pgvector
+        score_expr = (1 - Catalog.embedding.cosine_distance(embedding)).label("score")
+        
+        query = select(Catalog, score_expr)
+        
+        # Apply filters
+        filters = []
+        if catalog_type:
+            try:
+                # Handle both string and enum if possible
+                filters.append(Catalog.catalog_type == catalog_type)
+            except Exception:
+                pass
+        
+        if year_from is not None:
+            filters.append(Catalog.publication_year >= year_from)
+        
+        if year_to is not None:
+            filters.append(Catalog.publication_year <= year_to)
+            
+        if filters:
+            query = query.where(and_(*filters))
+            
+        # Order by distance (ascending) and limit
+        query = query.order_by(Catalog.embedding.cosine_distance(embedding)).limit(limit)
+        
+        logger.info(f"[CRUD] Vector search limit={limit}")
+        result = await self.session.execute(query)
+        rows = result.all()
+        
+        return [(row[0], float(row[1])) for row in rows]
+
     async def search(
         self,
         query: str,
@@ -135,7 +180,7 @@ class CatalogCRUD:
         Returns list of (catalog, score) tuples and total count.
         """
         if search_fields is None:
-            search_fields = ["title", "author", "subject"]
+            search_fields = ["title", "author", "subject", "abstract"]
         
         # Build search conditions
         search_conditions = []
@@ -145,6 +190,7 @@ class CatalogCRUD:
             "title": Catalog.title,
             "author": Catalog.author,
             "subject": Catalog.subject,
+            "abstract": Catalog.abstract,
             "publisher": Catalog.publisher,
             "editor": Catalog.editor,
         }
@@ -156,26 +202,18 @@ class CatalogCRUD:
                 )
         
         logger.info(f"[CRUD] Search params: query='{query}', fields={search_fields}, limit={limit}")
-        logger.debug(f"[CRUD] Search conditions: {len(search_conditions)} conditions, query_lower='{query_lower}'")
         
         # Build base query
         base_query = select(Catalog)
         
         if search_conditions:
             base_query = base_query.where(or_(*search_conditions))
-            logger.debug(f"[CRUD] Added search conditions to query")
         
         # Add filters
         filters = []
         
         if catalog_type:
-            try:
-                cat_type_enum = CatalogType(catalog_type)
-                filters.append(Catalog.catalog_type == cat_type_enum)
-                logger.debug(f"[CRUD] Added catalog_type filter: {catalog_type}")
-            except ValueError:
-                logger.warning(f"[CRUD] Invalid catalog_type: {catalog_type}")
-                pass
+            filters.append(Catalog.catalog_type == catalog_type)
         
         if year_from is not None:
             filters.append(Catalog.publication_year >= year_from)
@@ -186,46 +224,29 @@ class CatalogCRUD:
         if filters:
             base_query = base_query.where(and_(*filters))
         
-        # Get total count - count from the subquery
+        # Get total count
         count_query = select(func.count()).select_from(base_query.subquery())
-        logger.debug(f"[CRUD] Executing count query...")
         count_result = await self.session.execute(count_query)
         total = count_result.scalar() or 0
-        logger.info(f"[CRUD] Total matching records: {total}")
         
-        # Calculate relevance score using full-text search ranking
-        # Higher score if match in title, then author, then subject
+        # Relevance score
         score_expr = func.coalesce(
-            case(
-                (func.lower(Catalog.title).like(query_lower), 3.0),
-                else_=0.0
-            ), 0.0
+            case((func.lower(Catalog.title).like(query_lower), 3.0), else_=0.0), 0.0
         ) + func.coalesce(
-            case(
-                (func.lower(Catalog.author).like(query_lower), 2.0),
-                else_=0.0
-            ), 0.0
+            case((func.lower(Catalog.author).like(query_lower), 2.0), else_=0.0), 0.0
         ) + func.coalesce(
-            case(
-                (func.lower(Catalog.subject).like(query_lower), 1.0),
-                else_=0.0
-            ), 0.0
+            case((func.lower(Catalog.abstract).like(query_lower), 1.5), else_=0.0), 0.0
+        ) + func.coalesce(
+            case((func.lower(Catalog.subject).like(query_lower), 1.0), else_=0.0), 0.0
         )
         
-        # Build final query with scoring
+        # Final query
         query_with_score = base_query.add_columns(score_expr.label("score"))
         query_with_score = query_with_score.order_by(score_expr.desc(), Catalog.id.desc())
         query_with_score = query_with_score.offset(offset).limit(limit)
         
-        logger.debug(f"[CRUD] Executing final query with scoring...")
         result = await self.session.execute(query_with_score)
         rows = result.all()
-        logger.info(f"[CRUD] Query returned {len(rows)} rows")
-        
-        for i, row in enumerate(rows[:3]):  # Log first 3 results
-            catalog = row[0]
-            score = row[1]
-            logger.debug(f"[CRUD] Result {i+1}: '{catalog.title}' (score: {score})")
         
         return [(row[0], float(row[1])) for row in rows], total
     

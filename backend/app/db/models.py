@@ -7,6 +7,7 @@ from sqlalchemy import (
     Column, Integer, String, Text, SmallInteger, Index, Enum as SQLEnum
 )
 from sqlalchemy.orm import Mapped, mapped_column
+from pgvector.sqlalchemy import Vector
 from app.database import Base
 import enum
 
@@ -73,9 +74,9 @@ class Catalog(Base):
     )
     
     catalog_type: Mapped[str | None] = mapped_column(
-        String(100),
+        String(255),
         nullable=True,
-        comment="Type of catalog item"
+        comment="Type of catalog item (Mapped to public.catalog_type enum in DB)"
     )
     
     classification_number: Mapped[str | None] = mapped_column(
@@ -140,30 +141,30 @@ class Catalog(Base):
         comment="URL for electronic access"
     )
     
+    abstract: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Paper abstract or summary"
+    )
+    
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(1024),
+        nullable=True,
+        comment="Vector embedding of title and abstract"
+    )
+    
     # Table configuration
     __table_args__ = (
         Index(
             'catalog_publication_year_idx',
             'publication_year',
             postgresql_using='btree',
-            postgresql_ops={'publication_year': 'int2_ops'}
-        ),
-        Index(
-            'catalog_type_idx',
-            'catalog_type',
-            postgresql_using='btree'
-        ),
-        Index(
-            'catalog_title_idx',
-            'title',
-            postgresql_using='gin',
-            postgresql_ops={'title': 'gin_trgm_ops'}
         ),
         {'comment': 'Telkom University library catalog for research papers'}
     )
     
     def __repr__(self) -> str:
-        return f"<Catalog(id={self.id}, title='{self.title[:50]}...', type={self.catalog_type})>"
+        return f"<Catalog(id={self.id}, title='{self.title[:50]}...')>"
     
     def to_dict(self) -> dict:
         """Convert model to dictionary for API responses."""
@@ -171,7 +172,7 @@ class Catalog(Base):
             "id": self.id,
             "title": self.title,
             "catalogNumber": self.catalog_number,
-            "catalogType": self.catalog_type.value if self.catalog_type else None,
+            "catalogType": self.catalog_type,
             "classificationNumber": self.classification_number,
             "subject": self.subject,
             "author": self.author,
@@ -182,4 +183,5 @@ class Catalog(Base):
             "publicationYear": self.publication_year,
             "totalCopies": self.total_copies,
             "accessLink": self.access_link,
+            "abstract": self.abstract,
         }

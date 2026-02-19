@@ -1,40 +1,36 @@
-"""
-Paper retriever service for searching and retrieving papers from database.
-Uses PostgreSQL with SQLAlchemy for async queries.
-"""
-
 import logging
+import voyageai
 from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.models import PaperResult
 from app.db.crud import CatalogCRUD
 from app.db.models import Catalog
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 
 class PaperRetriever:
     """
-    Database-backed paper retriever using PostgreSQL.
-    
-    Replaces the mock data with real catalog data from Supabase.
-    Supports keyword search with relevance scoring.
-    
-    TODO: Add vector search implementation:
-    - dspy.retrievers.Embeddings for semantic search
-    - Hybrid approach: BM25 on title + vector on abstract
+    Search-optimized paper retriever using Voyage AI embeddings and PGVector.
     """
     
     def __init__(self, db_session: Optional[AsyncSession] = None):
-        """
-        Initialize retriever.
-        
-        Args:
-            db_session: Async database session (can be set later)
-        """
+        """Initialize retriever."""
+        settings = get_settings()
         self.db_session = db_session
         self._crud: Optional[CatalogCRUD] = None
         self._papers_cache: List[PaperResult] = []
+        
+        # Initialize Voyage AI client
+        api_key = settings.VOYAGE_API_KEY
+        if api_key:
+            self.voyage_client = voyageai.AsyncClient(api_key=api_key)
+            self.embedding_model = settings.EMBEDDING_MODEL
+            logger.info(f"[RETRIEVER] Voyage AI initialized with model: {self.embedding_model}")
+        else:
+            self.voyage_client = None
+            logger.warning("[RETRIEVER] VOYAGE_API_KEY not set. Vector search will be disabled.")
     
     def set_session(self, db_session: AsyncSession):
         """Set the database session (called during app startup)."""
@@ -47,133 +43,112 @@ class PaperRetriever:
             id=f"catalog_{catalog.id}",
             title=catalog.title,
             authors=catalog.author.split(", ") if catalog.author else ["Unknown"],
-            abstract=catalog.subject or "No abstract available",
+            abstract=catalog.abstract or catalog.subject or "No abstract available",
             year=catalog.publication_year or 0,
             keywords=[catalog.catalog_type] if catalog.catalog_type else [],
             relevance_score=relevance_score
         )
     
+    async def _get_embedding(self, text: str) -> List[float]:
+        """Get embedding for text using Voyage AI."""
+        if not self.voyage_client:
+            raise ValueError("Voyage AI client not initialized")
+        
+        # Voyage AI suggests using truncation for long inputs
+        result = await self.voyage_client.embed(
+            [text],
+            model=self.embedding_model,
+            input_type="query"  # Crucial for retrieval performance
+        )
+        return result.embeddings[0]
+
     async def search(
         self,
         query: str,
         limit: int = 5,
-        search_field: str = "all",
         catalog_type: Optional[str] = None,
         year_from: Optional[int] = None,
-        year_to: Optional[int] = None
+        year_to: Optional[int] = None,
+        use_vector: bool = True
     ) -> List[PaperResult]:
         """
-        Search papers in database by keyword.
+        Search papers in database. Uses vector search if available.
         
         Args:
             query: Search query
             limit: Maximum results
-            search_field: Which field to search ('all', 'title', 'subject', 'author')
             catalog_type: Filter by catalog type
             year_from: Filter by minimum year
             year_to: Filter by maximum year
+            use_vector: Whether to use semantic vector search
             
         Returns:
             List of papers with relevance scores
         """
-        logger.info(f"[RETRIEVER] Searching for query: '{query}' with limit={limit}, field={search_field}")
+        logger.info(f"[RETRIEVER] Searching for: '{query}' (limit={limit}, vector={use_vector})")
         
         if not self._crud:
-            logger.warning("[RETRIEVER] No CRUD available, falling back to cache search")
             return self._search_cache(query, limit)
         
-        # Map search fields
-        field_mapping = {
-            "all": ["title", "author", "subject"],
-            "title": ["title"],
-            "abstract": ["subject"],  # Drizzle schema uses 'subject' not 'abstract'
-            "authors": ["author"],
-            "subject": ["subject"],
-        }
-        search_fields = field_mapping.get(search_field, field_mapping["all"])
-        logger.info(f"[RETRIEVER] Search fields: {search_fields}")
-        
-        # Query database
         try:
-            results, total = await self._crud.search(
-                query=query,
-                search_fields=search_fields,
-                catalog_type=catalog_type,
-                year_from=year_from,
-                year_to=year_to,
-                limit=limit,
-                offset=0
-            )
-            logger.info(f"[RETRIEVER] DB returned {len(results)} results (total: {total})")
+            if use_vector and self.voyage_client:
+                # Semantic Vector Search
+                embedding = await self._get_embedding(query)
+                results = await self._crud.vector_search(
+                    embedding=embedding,
+                    limit=limit,
+                    catalog_type=catalog_type,
+                    year_from=year_from,
+                    year_to=year_to
+                )
+                logger.info(f"[RETRIEVER] Vector search returned {len(results)} results")
+            else:
+                # Keyword Search Fallback
+                results, _ = await self._crud.search(
+                    query=query,
+                    catalog_type=catalog_type,
+                    year_from=year_from,
+                    year_to=year_to,
+                    limit=limit
+                )
+                logger.info(f"[RETRIEVER] Keyword search returned {len(results)} results")
+                
+            return [self._catalog_to_paper(c, score) for c, score in results]
+            
         except Exception as e:
-            logger.error(f"[RETRIEVER] Error during DB search: {e}", exc_info=True)
+            logger.error(f"[RETRIEVER] Search error: {e}", exc_info=True)
+            # Fallback to keyword search if vector search fails
+            if use_vector:
+                return await self.search(query, limit, catalog_type, year_from, year_to, use_vector=False)
             raise
-        
-        # Convert to PaperResult
-        papers = []
-        for catalog, score in results:
-            paper = self._catalog_to_paper(catalog, relevance_score=score)
-            papers.append(paper)
-            logger.debug(f"[RETRIEVER] Result: {paper.title} (score: {score})")
-        
-        logger.info(f"[RETRIEVER] Returning {len(papers)} papers")
-        return papers
     
     def _search_cache(self, query: str, limit: int) -> List[PaperResult]:
-        """Search in cached papers (fallback when DB unavailable)."""
+        """Search in cached papers (fallback)."""
         query_lower = query.lower()
-        query_words = query_lower.split()
         matches = []
-        
         for paper in self._papers_cache:
-            score = 0
-            title_lower = paper.title.lower()
-            
-            if any(word in title_lower for word in query_words):
-                score += 3
-            if query_lower in title_lower:
-                score += 5
-            
-            if score > 0:
-                paper_dict = paper.model_dump()
-                paper_dict["relevance_score"] = score
-                matches.append((score, PaperResult(**paper_dict)))
-        
-        matches.sort(key=lambda x: x[0], reverse=True)
-        return [paper for _, paper in matches[:limit]]
+            if query_lower in paper.title.lower() or query_lower in (paper.abstract or "").lower():
+                matches.append(paper)
+        return matches[:limit]
     
     async def get_context(self, query: str, top_k: int = 3) -> str:
-        """
-        Get formatted context string for RAG.
-        
-        Args:
-            query: Search query
-            top_k: Number of papers to include
-            
-        Returns:
-            Formatted context string
-        """
-        logger.info(f"[RETRIEVER] Getting context for query: '{query}' (top_k={top_k})")
+        """Get formatted context string for RAG."""
+        logger.info(f"[RETRIEVER] Context retrieval for: '{query}'")
         papers = await self.search(query, limit=top_k)
         
         if not papers:
-            logger.warning(f"[RETRIEVER] No papers found for query: '{query}'")
             return "No relevant papers found in the catalog."
         
         context_parts = []
         for i, paper in enumerate(papers, 1):
             context_parts.append(
-                f"Paper {i} (ID: {paper.id}):\n"
+                f"Paper {i} (ID: {paper.id})\n"
                 f"Title: {paper.title}\n"
-                f"Authors: {', '.join(paper.authors)}\n"
                 f"Year: {paper.year}\n"
                 f"Abstract: {paper.abstract}\n"
             )
         
-        context = "\n---\n".join(context_parts)
-        logger.info(f"[RETRIEVER] Built context with {len(papers)} papers (length: {len(context)} chars)")
-        logger.debug(f"[RETRIEVER] Context preview: {context[:200]}...")
-        return context
+        return "\n---\n".join(context_parts)
     
     async def get_all_papers(self, limit: int = 100) -> List[PaperResult]:
         """Return all papers from database."""
