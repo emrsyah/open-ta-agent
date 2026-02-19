@@ -6,6 +6,7 @@ import logging
 import dspy
 from typing import List, Optional
 from app.services.retriever import PaperRetriever
+from app.core.models import CitedPaper
 
 logger = logging.getLogger(__name__)
 
@@ -23,15 +24,47 @@ class QueryGenerationSignature(dspy.Signature):
 
 class PaperChatSignature(dspy.Signature):
     """
-    Signature for paper Q&A with citations.
-    
-    Input: question and context (retrieved papers)
-    Output: answer with cited sources
+    You are 'OpenTA Agent', a specialized research assistant for Telkom University.
+
+    Your behavior:
+    - Maintain a professional, academic, yet friendly and helpful tone.
+    - Consider conversation history to provide context-aware responses.
+    - If context is provided, answer BASED ONLY on that context.
+    - After every sentence or clause that uses information from a paper, append an inline citation like [1] or [1,2].
+      The number corresponds to the paper's number in the context (Paper 1 → [1], Paper 2 → [2], etc.).
+    - If no context/papers are relevant but the question is general, answer politely as a knowledgeable assistant without citations.
+    - Use Indonesian for questions in Indonesian, and English for questions in English.
+    - Reference previous conversation turns when appropriate.
+    - Format the answer in Markdown (use headers, bullet points, bold where appropriate).
     """
-    question: str = dspy.InputField(desc="User's question about research papers")
-    context: str = dspy.InputField(desc="Relevant paper abstracts and titles")
-    answer: str = dspy.OutputField(desc="Comprehensive answer with citations")
-    sources: List[str] = dspy.OutputField(desc="List of paper IDs referenced")
+    question: str = dspy.InputField(desc="User's current question about research papers")
+    context: str = dspy.InputField(desc="Relevant paper abstracts and titles, numbered as Paper 1, Paper 2, etc.")
+    history: dspy.History = dspy.InputField(desc="Previous conversation turns for context")
+    answer: str = dspy.OutputField(desc="Markdown-formatted answer with inline citations [1], [2] after every sentence that references a paper")
+    sources: List[str] = dspy.OutputField(desc="List of paper IDs actually cited in the answer, in citation order (e.g. the ID of Paper 1 first if [1] was used, then Paper 2's ID if [2] was used, etc.)")
+
+
+class IntentClassificationSignature(dspy.Signature):
+    """
+    Categorize user input to decide if database research is needed.
+    
+    Categories:
+    - 'research': Specific questions about papers, topics, authors, or research areas.
+    - 'general': Greetings, identity ('who are you?'), general AI talk, or simple conversation.
+    """
+    question: str = dspy.InputField()
+    category: str = dspy.OutputField(desc="'research' or 'general'")
+    explanation: str = dspy.OutputField(desc="Brief reasoning for the chosen category")
+
+
+class IntentClassifier(dspy.Module):
+    """Classifies user intent to optimize retrieval paths."""
+    def __init__(self):
+        super().__init__()
+        self.classify = dspy.Predict(IntentClassificationSignature)
+        
+    def forward(self, question: str) -> dspy.Prediction:
+        return self.classify(question=question)
 
 
 class QueryGenerator(dspy.Module):
@@ -84,21 +117,27 @@ class PaperRAG(dspy.Module):
         self.retriever = retriever
         self.generate = dspy.ChainOfThought(PaperChatSignature)
     
-    def forward(self, question: str, context: str) -> dspy.Prediction:
+    def forward(self, question: str, context: str, history: Optional[dspy.History] = None) -> dspy.Prediction:
         """
-        Process a question and generate an answer.
+        Process a question and generate an answer with conversation history.
         
         Args:
             question: User's question
             context: Pre-retrieved paper context string
+            history: Conversation history for context-aware responses
             
         Returns:
             DSPy Prediction with answer and sources
         """
-        # Generate answer with reasoning
+        # Use empty history if none provided
+        if history is None:
+            history = dspy.History(messages=[])
+        
+        # Generate answer with reasoning and history context
         result = self.generate(
             question=question,
-            context=context
+            context=context,
+            history=history
         )
         
         return dspy.Prediction(
@@ -127,6 +166,7 @@ class RAGService:
         self.retriever = retriever or PaperRetriever()
         self.rag_module = PaperRAG(retriever=self.retriever)
         self.query_generator = QueryGenerator()
+        self.intent_classifier = IntentClassifier()
         self.cheap_lm = cheap_lm
     
     def _generate_search_query(self, user_question: str) -> str:
@@ -156,38 +196,142 @@ class RAGService:
         logger.debug(f"[RAG] Query generation rationale: {getattr(result, 'rationale', 'N/A')}")
         return search_query
     
-    async def chat(self, question: str) -> dict:
+    def _build_cited_papers(
+        self,
+        source_ids: List[str],
+        retrieved_papers: list
+    ) -> List[CitedPaper]:
         """
-        Get answer for a question (non-streaming).
+        Match DSPy-returned source IDs against already-retrieved papers to build
+        CitedPaper objects without extra DB calls.
+        Citation number is the 1-based position in the sources list.
+        """
+        paper_map = {p.id: p for p in retrieved_papers}
+        cited = []
+        seen = set()
+        for i, pid in enumerate(source_ids, 1):
+            if pid in seen:
+                continue
+            seen.add(pid)
+            paper = paper_map.get(pid)
+            if paper:
+                cited.append(CitedPaper(
+                    id=paper.id,
+                    title=paper.title,
+                    authors=paper.authors,
+                    abstract=paper.abstract,
+                    year=paper.year,
+                    citation_number=i,
+                ))
+        return cited
+
+    def _convert_to_dspy_history(self, history_messages: Optional[List[dict]]) -> dspy.History:
+        """
+        Convert conversation history from request model to dspy.History.
+        
+        Args:
+            history_messages: List of conversation messages from ChatRequest
+            
+        Returns:
+            dspy.History object with converted messages
+        """
+        if not history_messages:
+            return dspy.History(messages=[])
+        
+        dspy_messages = []
+        for msg in history_messages:
+            # Convert each message to the format expected by dspy.History
+            history_entry = {
+                "question": msg.get("question", ""),
+                "answer": msg.get("answer", ""),
+                "context": msg.get("context", ""),
+            }
+            # Include sources if available
+            if msg.get("sources"):
+                history_entry["sources"] = msg.get("sources")
+            
+            dspy_messages.append(history_entry)
+        
+        return dspy.History(messages=dspy_messages)
+    
+    async def chat(
+        self, 
+        question: str, 
+        history: Optional[List[dict]] = None,
+        language: str = "en-US",
+        source_preference: str = "all"
+    ) -> dict:
+        """
+        Get answer for a question with conversation history support (non-streaming).
         
         Args:
             question: User question
+            history: Optional list of previous conversation messages
+            language: User's preferred language (e.g., 'id-ID', 'en-US')
+            source_preference: Filter for sources ('all', 'only_papers', 'only_general')
             
         Returns:
             Dict with answer, sources, and optional rationale
         """
         logger.info(f"[RAG] Processing question: '{question}'")
+        if history:
+            logger.info(f"[RAG] Using conversation history with {len(history)} previous turns")
         
+        # Convert history to dspy.History format
+        dspy_history = self._convert_to_dspy_history(history)
+        
+        # Step 0: Classify intent
+        logger.info("[RAG] Classifying intent...")
+        if self.cheap_lm:
+            with dspy.context(lm=self.cheap_lm):
+                intent_res = self.intent_classifier(question=question)
+        else:
+            intent_res = self.intent_classifier(question=question)
+            
+        logger.info(f"[RAG] Intent classified: {intent_res.category} ({intent_res.explanation})")
+        
+        if intent_res.category == "general":
+            logger.info("[RAG] General intent detected. Skipping retrieval.")
+            result = self.rag_module(
+                question=question,
+                context="No paper context needed for this general query.",
+                history=dspy_history
+            )
+            return {
+                "answer": result.answer,
+                "sources": [],
+                "rationale": getattr(result, 'rationale', None),
+                "search_query": None
+            }
+
         # Step 1: Generate optimized search query using LLM
         search_query = self._generate_search_query(question)
-        
-        # Step 2: Retrieve context using the generated query
+
+        # Step 2: Retrieve context + papers together (avoids extra DB calls later)
         logger.info(f"[RAG] Retrieving context with query: '{search_query}'")
-        context = await self.retriever.get_context(search_query)
-        logger.info(f"[RAG] Context retrieved (length: {len(context)} chars)")
-        logger.debug(f"[RAG] Context content: {context[:300]}...")
-        
-        # Step 3: Generate answer (sync DSPy module)
-        logger.info("[RAG] Generating answer with DSPy...")
-        result = self.rag_module(question=question, context=context)
-        
-        logger.info(f"[RAG] Answer generated (length: {len(result.answer)} chars, sources: {result.sources})")
-        
+        context, retrieved_papers = await self.retriever.get_papers_with_context(search_query)
+        logger.info(f"[RAG] Context retrieved (length: {len(context)} chars, {len(retrieved_papers)} papers)")
+
+        # Step 3: Generate answer with history context
+        logger.info("[RAG] Generating answer with DSPy and conversation history...")
+        result = self.rag_module(
+            question=question,
+            context=context,
+            history=dspy_history
+        )
+
+        cited_papers = self._build_cited_papers(
+            getattr(result, 'sources', []),
+            retrieved_papers
+        )
+
+        logger.info(f"[RAG] Answer generated ({len(result.answer)} chars, {len(cited_papers)} cited papers)")
+
         return {
             "answer": result.answer,
-            "sources": result.sources,
+            "sources": cited_papers,
             "rationale": getattr(result, 'rationale', None),
-            "search_query": search_query  # Include for transparency
+            "search_query": search_query
         }
     
     def get_module(self) -> PaperRAG:

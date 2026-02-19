@@ -29,3 +29,6 @@ psycopg2-binary
 # Vector Search and Embeddings
 pgvector
 voyageai
+
+# Redis (for conversation session management)
+redis[hiredis]>=5.0.0

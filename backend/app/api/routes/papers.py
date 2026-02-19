@@ -35,10 +35,9 @@ async def search_papers_get(
     rag_service = get_rag_service()
     retriever = rag_service.get_retriever()
     
-    results = retriever.search(
+    results = await retriever.search(
         query=query,
-        limit=limit,
-        search_field=search_field
+        limit=limit
     )
     
     return SearchResponse(
@@ -80,7 +79,7 @@ async def list_all_papers():
     rag_service = get_rag_service()
     retriever = rag_service.get_retriever()
     
-    return retriever.get_all_papers()
+    return await retriever.get_all_papers()
 
 
 @router.get("/list", response_model=List[Paper])

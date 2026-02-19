@@ -131,24 +131,33 @@ class PaperRetriever:
                 matches.append(paper)
         return matches[:limit]
     
-    async def get_context(self, query: str, top_k: int = 3) -> str:
-        """Get formatted context string for RAG."""
+    async def get_papers_with_context(self, query: str, top_k: int = 3) -> tuple[str, List[PaperResult]]:
+        """
+        Retrieve papers and return both the formatted context string and the paper objects.
+        Use this instead of get_context() so callers can enrich sources without extra DB calls.
+        """
         logger.info(f"[RETRIEVER] Context retrieval for: '{query}'")
         papers = await self.search(query, limit=top_k)
-        
+
         if not papers:
-            return "No relevant papers found in the catalog."
-        
+            return "No relevant papers found in the catalog.", []
+
         context_parts = []
         for i, paper in enumerate(papers, 1):
             context_parts.append(
                 f"Paper {i} (ID: {paper.id})\n"
                 f"Title: {paper.title}\n"
+                f"Authors: {', '.join(paper.authors)}\n"
                 f"Year: {paper.year}\n"
                 f"Abstract: {paper.abstract}\n"
             )
-        
-        return "\n---\n".join(context_parts)
+
+        return "\n---\n".join(context_parts), papers
+
+    async def get_context(self, query: str, top_k: int = 3) -> str:
+        """Get formatted context string for RAG."""
+        context, _ = await self.get_papers_with_context(query, top_k)
+        return context
     
     async def get_all_papers(self, limit: int = 100) -> List[PaperResult]:
         """Return all papers from database."""
