@@ -4,8 +4,10 @@ Telkom Paper Research API - Main Application Entry Point
 This is the refactored, maintainable version of the backend.
 """
 
+import logging
+
 import dspy
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
@@ -14,6 +16,10 @@ from app.database import get_session_factory, close_db, get_engine
 from app.api.routes import chat, papers, health
 from app.services.rag import init_rag_service
 from app.services.retriever import PaperRetriever
+from app.utils.logging_config import setup_logging
+
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -22,118 +28,103 @@ async def lifespan(app: FastAPI):
     Application lifespan manager.
     Handles startup and shutdown events.
     """
-    # Startup
     settings = get_settings()
-    
+    setup_logging(debug=settings.DEBUG)
+
     # Configure DSPy with dual models
     if settings.is_openrouter():
-        print("🚀 Using OpenRouter API")
-        # Main model for high-quality answer generation
+        logger.info("Using OpenRouter API")
         main_lm = dspy.LM(
             settings.DSPY_MODEL,
             api_base=settings.OPENROUTER_BASE_URL,
             api_key=settings.get_api_key(),
             model_type="chat"
         )
-        # Cheap model for query generation and simple tasks
         cheap_lm = dspy.LM(
             settings.DSPY_CHEAP_MODEL,
             api_base=settings.OPENROUTER_BASE_URL,
             api_key=settings.get_api_key(),
             model_type="chat"
         )
-        print(f"   Main model: {settings.DSPY_MODEL}")
-        print(f"   Cheap model: {settings.DSPY_CHEAP_MODEL}")
+        logger.info("Main model: %s", settings.DSPY_MODEL)
+        logger.info("Cheap model: %s", settings.DSPY_CHEAP_MODEL)
     else:
-        print("🔑 Using OpenAI API")
+        logger.info("Using OpenAI API")
         main_lm = dspy.LM(
             settings.DSPY_FALLBACK_MODEL,
             api_key=settings.get_api_key()
         )
         cheap_lm = dspy.LM(
-            "gpt-3.5-turbo",  # Cheap fallback
+            "gpt-3.5-turbo",
             api_key=settings.get_api_key()
         )
-    
-    # Configure default LM (main model)
+
     dspy.configure(lm=main_lm, async_max_workers=settings.DSPY_MAX_WORKERS)
-    
-    # Store both models in app state
+
     app.state.main_lm = main_lm
     app.state.cheap_lm = cheap_lm
-    
-    # Initialize database connection and services
+
     db_session = None
     try:
-        # Try to initialize database
         session_factory = get_session_factory()
-        
+
         if session_factory is not None:
-            # Create a database session for the retriever
             db_session = session_factory()
             retriever = PaperRetriever()
             retriever.set_session(db_session)
-            
-            # Store retriever in app state for dependency injection
+
             app.state.retriever = retriever
             app.state.db_session = db_session
-            
+
             init_rag_service(retriever, cheap_lm=cheap_lm)
-            
-            # Get paper count from database
+
             all_papers = await retriever.get_all_papers(limit=10)
             paper_count = len(all_papers)
-            
-            # Close the session - it will be recreated per-request
+
             await db_session.close()
             db_session = None
-            
-            print(f"✅ {settings.APP_NAME} v{settings.APP_VERSION} started")
-            print(f"🗄️  Database connected")
-            print(f"📚 Loaded {paper_count} papers from database")
+
+            logger.info("%s v%s started", settings.APP_NAME, settings.APP_VERSION)
+            logger.info("Database connected")
+            logger.info("Loaded %d papers from database", paper_count)
         else:
-            # Database not configured
-            print("⚠️  Database not configured")
-            print("📚 Using mock data (set DATABASE_URL in .env to use real database)")
+            logger.warning("Database not configured — using mock data")
             retriever = PaperRetriever()
             init_rag_service(retriever, cheap_lm=cheap_lm)
             app.state.retriever = retriever
-        
+
     except Exception as e:
-        print(f"⚠️  Database connection failed: {e}")
-        print("📚 Falling back to mock data")
+        logger.warning("Database connection failed: %s — falling back to mock data", e)
         if db_session:
             await db_session.close()
         retriever = PaperRetriever()
         init_rag_service(retriever, cheap_lm=cheap_lm)
         app.state.retriever = retriever
-    
+
     yield
-    
+
     # Shutdown
-    print("👋 Shutting down...")
-    
-    # Close database connections
+    logger.info("Shutting down...")
     try:
         if hasattr(app.state, 'db_session'):
             await app.state.db_session.close()
         await close_db()
-        print("🗄️  Database connections closed")
+        logger.info("Database connections closed")
     except Exception as e:
-        print(f"⚠️  Error closing database: {e}")
+        logger.warning("Error closing database: %s", e)
 
 
 def create_app() -> FastAPI:
     """Application factory."""
     settings = get_settings()
-    
+
     app = FastAPI(
         title=settings.APP_NAME,
         description=settings.APP_DESCRIPTION,
         version=settings.APP_VERSION,
         lifespan=lifespan
     )
-    
+
     # CORS middleware
     app.add_middleware(
         CORSMiddleware,
@@ -142,12 +133,53 @@ def create_app() -> FastAPI:
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["Content-Type", "Authorization"],
     )
-    
+
+    # Request logging middleware — logs query for /chat endpoints
+    @app.middleware("http")
+    async def log_requests(request: Request, call_next):
+        import time
+        import json as _json
+
+        _log = logging.getLogger(__name__)
+        start = time.perf_counter()
+
+        # For chat endpoints, parse and log the incoming query
+        if request.url.path.startswith("/chat") and request.method == "POST":
+            try:
+                body_bytes = await request.body()
+                body = _json.loads(body_bytes)
+                query = body.get("query") or body.get("question") or "<no query>"
+                conv_id = (body.get("meta_params") or {}).get("conversation_id") or body.get("conversation_id")
+                stream = (body.get("meta_params") or {}).get("stream", body.get("stream", True))
+                _log.info(
+                    "[REQUEST] %s | query=%r | stream=%s | conversation_id=%s",
+                    request.url.path, query, stream, conv_id or "none",
+                )
+
+                # Re-attach body so downstream handlers can still read it
+                async def receive():
+                    return {"type": "http.request", "body": body_bytes, "more_body": False}
+
+                request = Request(request.scope, receive)
+            except Exception:
+                pass  # Don't break the request if logging fails
+
+        response = await call_next(request)
+
+        duration_ms = int((time.perf_counter() - start) * 1000)
+        if request.url.path.startswith("/chat"):
+            _log.info(
+                "[RESPONSE] %s %s | %dms",
+                request.method, request.url.path, duration_ms,
+            )
+
+        return response
+
     # Include routers
     app.include_router(health.router)
     app.include_router(papers.router)
     app.include_router(chat.router)
-    
+
     return app
 
 
