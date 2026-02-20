@@ -126,16 +126,18 @@ class CatalogCRUD:
         limit: int = 10,
         catalog_type: Optional[str] = None,
         year_from: Optional[int] = None,
-        year_to: Optional[int] = None
+        year_to: Optional[int] = None,
+        ef_search: int = 80,
     ) -> List[tuple[Catalog, float]]:
         """
         Search catalogs using vector similarity (cosine distance).
         Returns list of (catalog, score) tuples.
+        ef_search controls HNSW recall at query time (default 80, pgvector default is 40).
         """
-        # Calculate cosine similarity: 1 - cosine_distance
-        # <=> is the operator for cosine distance in pgvector
+        await self.session.execute(text(f"SET LOCAL hnsw.ef_search = {ef_search}"))
+
         score_expr = (1 - Catalog.embedding.cosine_distance(embedding)).label("score")
-        
+
         query = select(Catalog, score_expr)
         
         # Apply filters

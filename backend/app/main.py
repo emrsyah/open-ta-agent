@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from app.config import get_settings
-from app.database import get_session_factory, close_db, get_engine
+from app.database import get_session_factory, close_db
 from app.api.routes import chat, papers, health
 from app.services.rag import init_rag_service
 from app.services.retriever import PaperRetriever
@@ -64,39 +64,24 @@ async def lifespan(app: FastAPI):
     app.state.main_lm = main_lm
     app.state.cheap_lm = cheap_lm
 
-    db_session = None
     try:
+        retriever = PaperRetriever()
+        init_rag_service(retriever, cheap_lm=cheap_lm)
+        app.state.retriever = retriever
+
         session_factory = get_session_factory()
-
         if session_factory is not None:
-            db_session = session_factory()
-            retriever = PaperRetriever()
-            retriever.set_session(db_session)
-
-            app.state.retriever = retriever
-            app.state.db_session = db_session
-
-            init_rag_service(retriever, cheap_lm=cheap_lm)
-
+            # Probe the DB: retriever manages its own session internally
             all_papers = await retriever.get_all_papers(limit=10)
             paper_count = len(all_papers)
-
-            await db_session.close()
-            db_session = None
-
             logger.info("%s v%s started", settings.APP_NAME, settings.APP_VERSION)
             logger.info("Database connected")
             logger.info("Loaded %d papers from database", paper_count)
         else:
             logger.warning("Database not configured — using mock data")
-            retriever = PaperRetriever()
-            init_rag_service(retriever, cheap_lm=cheap_lm)
-            app.state.retriever = retriever
 
     except Exception as e:
         logger.warning("Database connection failed: %s — falling back to mock data", e)
-        if db_session:
-            await db_session.close()
         retriever = PaperRetriever()
         init_rag_service(retriever, cheap_lm=cheap_lm)
         app.state.retriever = retriever
@@ -106,8 +91,6 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Shutting down...")
     try:
-        if hasattr(app.state, 'db_session'):
-            await app.state.db_session.close()
         await close_db()
         logger.info("Database connections closed")
     except Exception as e:

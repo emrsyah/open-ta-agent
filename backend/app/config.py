@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     DSPY_FALLBACK_MODEL: str = "openai/gpt-4o-mini"
     
     # Cheap model (fast/cost-effective, for query generation and simple tasks)
-    DSPY_CHEAP_MODEL: str = "openrouter/openai/gpt-4o-mini"
+    DSPY_CHEAP_MODEL: str = "openrouter/google/gemini-2.5-flash-lite"
     # Alternative cheap options:
     # - "openrouter/meta-llama/llama-3.2-3b-instruct" (very cheap)
     # - "openrouter/google/gemini-flash-1.5" (fast)
@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     DATABASE_USER: Optional[str] = None
     DATABASE_PASSWORD: Optional[str] = None
     
+    # Redis
+    REDIS_URL: str = "redis://localhost:6379"
+
     # Database Pool Settings
     DB_POOL_SIZE: int = 5
     DB_MAX_OVERFLOW: int = 10

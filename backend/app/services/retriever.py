@@ -1,7 +1,8 @@
 import logging
+import time
 import voyageai
+from contextlib import asynccontextmanager
 from typing import List, Optional
-from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.models import PaperResult
 from app.db.crud import CatalogCRUD
 from app.db.models import Catalog
@@ -13,13 +14,12 @@ logger = logging.getLogger(__name__)
 class PaperRetriever:
     """
     Search-optimized paper retriever using Voyage AI embeddings and PGVector.
+    Uses per-call DB sessions to avoid stale connection issues.
     """
     
-    def __init__(self, db_session: Optional[AsyncSession] = None):
+    def __init__(self):
         """Initialize retriever."""
         settings = get_settings()
-        self.db_session = db_session
-        self._crud: Optional[CatalogCRUD] = None
         self._papers_cache: List[PaperResult] = []
         
         # Initialize Voyage AI client
@@ -31,11 +31,17 @@ class PaperRetriever:
         else:
             self.voyage_client = None
             logger.warning("[RETRIEVER] VOYAGE_API_KEY not set. Vector search will be disabled.")
-    
-    def set_session(self, db_session: AsyncSession):
-        """Set the database session (called during app startup)."""
-        self.db_session = db_session
-        self._crud = CatalogCRUD(db_session)
+
+    @asynccontextmanager
+    async def _get_crud(self):
+        """Context manager that yields a fresh CatalogCRUD with its own session."""
+        from app.database import get_session_factory
+        factory = get_session_factory()
+        if factory is None:
+            yield None
+            return
+        async with factory() as session:
+            yield CatalogCRUD(session)
     
     def _catalog_to_paper(self, catalog: Catalog, relevance_score: float = 0.0) -> PaperResult:
         """Convert database Catalog model to PaperResult API model."""
@@ -50,17 +56,28 @@ class PaperRetriever:
         )
     
     async def _get_embedding(self, text: str) -> List[float]:
-        """Get embedding for text using Voyage AI."""
+        """Get embedding for text using Voyage AI, with Redis cache."""
         if not self.voyage_client:
             raise ValueError("Voyage AI client not initialized")
-        
-        # Voyage AI suggests using truncation for long inputs
+
+        from app.utils.embedding_cache import get_cached_embedding, cache_embedding
+
+        cached = await get_cached_embedding(text, self.embedding_model)
+        if cached is not None:
+            logger.info("[RETRIEVER] Embedding cache hit for query")
+            return cached
+
+        t0 = time.perf_counter()
         result = await self.voyage_client.embed(
             [text],
             model=self.embedding_model,
-            input_type="query"  # Crucial for retrieval performance
+            input_type="query"
         )
-        return result.embeddings[0]
+        embedding = result.embeddings[0]
+        logger.info("[RETRIEVER] Voyage AI embedding took %.2fs", time.perf_counter() - t0)
+
+        await cache_embedding(text, self.embedding_model, embedding)
+        return embedding
 
     async def search(
         self,
@@ -86,41 +103,43 @@ class PaperRetriever:
             List of papers with relevance scores
         """
         logger.info(f"[RETRIEVER] Searching for: '{query}' (limit={limit}, vector={use_vector})")
-        
-        if not self._crud:
-            return self._search_cache(query, limit)
-        
-        try:
-            if use_vector and self.voyage_client:
-                # Semantic Vector Search
-                embedding = await self._get_embedding(query)
-                results = await self._crud.vector_search(
-                    embedding=embedding,
-                    limit=limit,
-                    catalog_type=catalog_type,
-                    year_from=year_from,
-                    year_to=year_to
-                )
-                logger.info(f"[RETRIEVER] Vector search returned {len(results)} results")
-            else:
-                # Keyword Search Fallback
-                results, _ = await self._crud.search(
-                    query=query,
-                    catalog_type=catalog_type,
-                    year_from=year_from,
-                    year_to=year_to,
-                    limit=limit
-                )
-                logger.info(f"[RETRIEVER] Keyword search returned {len(results)} results")
-                
-            return [self._catalog_to_paper(c, score) for c, score in results]
-            
-        except Exception as e:
-            logger.error(f"[RETRIEVER] Search error: {e}", exc_info=True)
-            # Fallback to keyword search if vector search fails
-            if use_vector:
-                return await self.search(query, limit, catalog_type, year_from, year_to, use_vector=False)
-            raise
+
+        async with self._get_crud() as crud:
+            if crud is None:
+                return self._search_cache(query, limit)
+
+            try:
+                if use_vector and self.voyage_client:
+                    embedding = await self._get_embedding(query)
+                    t0 = time.perf_counter()
+                    results = await crud.vector_search(
+                        embedding=embedding,
+                        limit=limit,
+                        catalog_type=catalog_type,
+                        year_from=year_from,
+                        year_to=year_to
+                    )
+                    logger.info(
+                        "[RETRIEVER] pgvector search took %.2fs, returned %d results",
+                        time.perf_counter() - t0, len(results)
+                    )
+                else:
+                    results, _ = await crud.search(
+                        query=query,
+                        catalog_type=catalog_type,
+                        year_from=year_from,
+                        year_to=year_to,
+                        limit=limit
+                    )
+                    logger.info(f"[RETRIEVER] Keyword search returned {len(results)} results")
+
+                return [self._catalog_to_paper(c, score) for c, score in results]
+
+            except Exception as e:
+                logger.error(f"[RETRIEVER] Search error: {e}", exc_info=True)
+                if use_vector:
+                    return await self.search(query, limit, catalog_type, year_from, year_to, use_vector=False)
+                raise
     
     def _search_cache(self, query: str, limit: int) -> List[PaperResult]:
         """Search in cached papers (fallback)."""
@@ -161,48 +180,42 @@ class PaperRetriever:
     
     async def get_all_papers(self, limit: int = 100) -> List[PaperResult]:
         """Return all papers from database."""
-        if not self._crud:
-            return self._papers_cache
-        
-        catalogs, _ = await self._crud.get_all(limit=limit, offset=0)
-        return [self._catalog_to_paper(c) for c in catalogs]
-    
+        async with self._get_crud() as crud:
+            if crud is None:
+                return self._papers_cache
+            catalogs, _ = await crud.get_all(limit=limit, offset=0)
+            return [self._catalog_to_paper(c) for c in catalogs]
+
     async def get_paper_by_id(self, paper_id: str) -> Optional[PaperResult]:
         """Get a single paper by ID."""
-        # Extract numeric ID from "catalog_X"
         try:
             catalog_id = int(paper_id.replace("catalog_", ""))
         except ValueError:
             return None
-        
-        if not self._crud:
-            # Search in cache
-            for paper in self._papers_cache:
-                if paper.id == paper_id:
-                    return paper
+
+        async with self._get_crud() as crud:
+            if crud is None:
+                for paper in self._papers_cache:
+                    if paper.id == paper_id:
+                        return paper
+                return None
+            catalog = await crud.get_by_id(catalog_id)
+            if catalog:
+                return self._catalog_to_paper(catalog)
             return None
-        
-        catalog = await self._crud.get_by_id(catalog_id)
-        if catalog:
-            return self._catalog_to_paper(catalog)
-        return None
-    
-    async def get_by_catalog_type(
-        self, 
-        catalog_type: str, 
-        limit: int = 100
-    ) -> List[PaperResult]:
+
+    async def get_by_catalog_type(self, catalog_type: str, limit: int = 100) -> List[PaperResult]:
         """Get papers by catalog type (e.g., 'skripsi', 'ePoster')."""
-        if not self._crud:
-            return []
-        
-        catalogs = await self._crud.get_by_catalog_type(catalog_type, limit)
-        return [self._catalog_to_paper(c) for c in catalogs]
-    
+        async with self._get_crud() as crud:
+            if crud is None:
+                return []
+            catalogs = await crud.get_by_catalog_type(catalog_type, limit)
+            return [self._catalog_to_paper(c) for c in catalogs]
+
     async def get_by_year(self, year: int, limit: int = 100) -> List[PaperResult]:
         """Get papers from a specific publication year."""
-        if not self._crud:
-            return []
-        
-        catalogs = await self._crud.get_recent_by_year(year, limit)
-        return [self._catalog_to_paper(c) for c in catalogs]
+        async with self._get_crud() as crud:
+            if crud is None:
+                return []
+            catalogs = await crud.get_recent_by_year(year, limit)
+            return [self._catalog_to_paper(c) for c in catalogs]

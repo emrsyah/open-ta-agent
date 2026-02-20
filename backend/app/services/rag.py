@@ -6,6 +6,7 @@ import logging
 import dspy
 from typing import List, Optional
 from app.services.retriever import PaperRetriever
+from app.services.planner import ResearchPlanner
 from app.core.models import CitedPaper
 
 logger = logging.getLogger(__name__)
@@ -167,6 +168,7 @@ class RAGService:
         self.rag_module = PaperRAG(retriever=self.retriever)
         self.query_generator = QueryGenerator()
         self.intent_classifier = IntentClassifier()
+        self.planner = ResearchPlanner()
         self.cheap_lm = cheap_lm
     
     def _generate_search_query(self, user_question: str) -> str:

@@ -89,22 +89,24 @@ async def chat_basic(request: ChatRequest):
     query_generator = rag_service.query_generator
     intent_classifier = rag_service.intent_classifier
     cheap_lm = rag_service.cheap_lm
-    
+    planner = rag_service.planner
+
     # Convert history to dspy.History format
     import dspy
     dspy_history = rag_service._convert_to_dspy_history(history)
-    
+
     return StreamingResponse(
         stream_dspy_response(
-            rag_module, 
-            retriever, 
-            question=query, 
-            query_generator=query_generator, 
+            rag_module,
+            retriever,
+            question=query,
+            query_generator=query_generator,
             intent_classifier=intent_classifier,
             cheap_lm=cheap_lm,
             history=dspy_history,
             language=meta_params.language,
-            source_preference=meta_params.source_preference
+            source_preference=meta_params.source_preference,
+            planner=planner,
         ),
         media_type="text/event-stream",
         headers={
