@@ -142,16 +142,19 @@ class SessionManager:
         data = await self._redis.get(session_key)
         
         if not data:
-            logger.warning(f"[SESSION] No history found for: {conversation_id}")
-            return []
-        
+            logger.info("[SESSION] Redis miss for %s — loading from DB", conversation_id)
+            messages = await self.load_from_database(conversation_id, limit=limit or self.max_messages)
+            if messages:
+                # Warm Redis cache for next request
+                await self._redis.setex(session_key, self.default_ttl, json.dumps(messages))
+            return messages
+
         messages = json.loads(data)
-        
-        # Apply limit if specified
+
         if limit and len(messages) > limit:
             messages = messages[-limit:]
-        
-        logger.info(f"[SESSION] Retrieved {len(messages)} messages for: {conversation_id}")
+
+        logger.info("[SESSION] Retrieved %d messages for: %s", len(messages), conversation_id)
         return messages
     
     async def add_message(
@@ -213,11 +216,10 @@ class SessionManager:
         # Update metadata
         await self._update_metadata(conversation_id, len(messages))
         
-        logger.info(f"[SESSION] Added message to {conversation_id} (total: {len(messages)})")
-        
-        # Optional: Save to database for long-term storage
-        if self.db_client:
-            await self._save_to_database(conversation_id, message)
+        logger.info("[SESSION] Added message to %s (total: %d)", conversation_id, len(messages))
+
+        # Always persist to DB for long-term storage
+        await self._save_to_database(conversation_id, message)
         
         return True
     
@@ -319,76 +321,73 @@ class SessionManager:
         
         return 0
     
-    async def _save_to_database(self, conversation_id: str, message: Dict):
+    async def _save_to_database(self, conversation_id: str, message: Dict) -> None:
+        """Persist a single message turn to Supabase via ConversationCRUD."""
+        from app.database import get_session_factory
+        from app.db.crud import ConversationCRUD
+
+        factory = get_session_factory()
+        if factory is None:
+            return
+
+        try:
+            async with factory() as session:
+                crud = ConversationCRUD(session)
+                # Ensure conversation row exists
+                await crud.upsert_conversation(
+                    conversation_id=conversation_id,
+                    title=message.get("title"),
+                    is_incognito=message.get("is_incognito", False),
+                )
+                await crud.add_message(
+                    conversation_id=conversation_id,
+                    question=message["question"],
+                    answer=message["answer"],
+                    sources=message.get("sources"),
+                    search_query=message.get("search_query"),
+                )
+            logger.debug("[SESSION] Persisted message to DB for conversation: %s", conversation_id)
+        except Exception as e:
+            logger.warning("[SESSION] DB save failed for %s: %s", conversation_id, e)
+
+    async def load_from_database(self, conversation_id: str, limit: int = 50) -> List[Dict]:
         """
-        Optional: Save message to database for long-term storage.
-        
-        This method should be implemented based on your database choice.
-        Example with Supabase:
-        
-        await self.db_client.table('conversation_messages').insert({
-            'conversation_id': conversation_id,
-            'question': message['question'],
-            'answer': message['answer'],
-            'sources': message['sources'],
-            'timestamp': message['timestamp']
-        }).execute()
+        Load conversation history from Supabase.
+        Called when Redis has no entry (expired or first load on new instance).
         """
-        if self.db_client:
-            # TODO: Implement database insertion
-            logger.debug(f"[SESSION] Saving to database: {conversation_id}")
-            pass
-    
-    async def load_from_database(
-        self,
-        conversation_id: str,
-        limit: int = 50
-    ) -> List[Dict]:
-        """
-        Optional: Load conversation history from database.
-        
-        Useful for:
-        - Recovering old conversations
-        - Loading conversations that expired from Redis
-        - Cross-device conversation sync
-        
-        Returns:
-            List of messages from database
-        """
-        if not self.db_client:
+        from app.database import get_session_factory
+        from app.db.crud import ConversationCRUD
+
+        factory = get_session_factory()
+        if factory is None:
             return []
-        
-        # TODO: Implement database query
-        # Example with Supabase:
-        # result = await self.db_client.table('conversation_messages')\
-        #     .select('*')\
-        #     .eq('conversation_id', conversation_id)\
-        #     .order('timestamp', desc=False)\
-        #     .limit(limit)\
-        #     .execute()
-        # return result.data
-        
-        logger.debug(f"[SESSION] Loading from database: {conversation_id}")
-        return []
-    
+
+        try:
+            async with factory() as session:
+                crud = ConversationCRUD(session)
+                messages = await crud.get_messages(conversation_id, limit=limit)
+                result = [
+                    {
+                        "question": m.question,
+                        "answer": m.answer,
+                        "sources": m.sources or [],
+                        "search_query": m.search_query,
+                        "timestamp": m.created_at.isoformat(),
+                    }
+                    for m in messages
+                ]
+            logger.info("[SESSION] Loaded %d messages from DB for: %s", len(result), conversation_id)
+            return result
+        except Exception as e:
+            logger.warning("[SESSION] DB load failed for %s: %s", conversation_id, e)
+            return []
+
     async def sync_to_database(self, conversation_id: str) -> bool:
-        """
-        Sync entire conversation from Redis to database.
-        
-        Useful for:
-        - Archiving important conversations
-        - Before session expiry
-        - User-initiated export
-        """
-        if not self.db_client:
-            return False
-        
+        """Sync all Redis messages for a conversation to the database."""
         messages = await self.get_history(conversation_id)
-        
         for message in messages:
             await self._save_to_database(conversation_id, message)
-        
-        logger.info(f"[SESSION] Synced {len(messages)} messages to database: {conversation_id}")
+        logger.info("[SESSION] Synced %d messages to DB: %s", len(messages), conversation_id)
         return True
 
 

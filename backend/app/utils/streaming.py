@@ -172,7 +172,14 @@ async def stream_dspy_response(
     source_preference: str = "all",
     include_metadata: bool = False,
     planner: ResearchPlanner | None = None,
+    on_complete: Any = None,
+    generate_title: Any = None,
 ) -> AsyncGenerator[str, None]:
+    """
+    on_complete:     async callable(answer, sources, search_query) — save history.
+    generate_title:  async callable(question, answer) -> str — generate conversation
+                     title; when provided a 'title' SSE event is emitted after 'done'.
+    """
     """
     Stream a planning-first agent response as SSE events.
 
@@ -265,13 +272,16 @@ async def stream_dspy_response(
                     token_count += 1
                     yield format_sse({"type": "token", "content": value.chunk})
                 elif isinstance(value, dspy.Prediction):
-                    yield format_sse(
-                        {
-                            "type": "done",
-                            "content": getattr(value, "answer", str(value)),
-                            "sources": [],
-                        }
-                    )
+                    general_answer = getattr(value, "answer", str(value))
+                    yield format_sse({"type": "done", "content": general_answer, "sources": []})
+                    if on_complete:
+                        await on_complete(answer=general_answer, sources=[], search_query=None)
+                    if generate_title:
+                        try:
+                            title = await generate_title(question=question, answer=general_answer)
+                            yield format_sse({"type": "title", "content": title})
+                        except Exception as _te:
+                            logger.warning("[STREAM] Title generation error: %s", _te)
 
             duration_ms = int((time.time() - start_time) * 1000)
             logger.info("[STREAM] General answer completed (%d tokens, %dms)", token_count, duration_ms)
@@ -430,13 +440,29 @@ async def stream_dspy_response(
                 cited_papers = _build_cited_papers(
                     getattr(value, "sources", []), unique_papers
                 )
+                final_answer = getattr(value, "answer", str(value))
+                final_sources = [p.model_dump() for p in cited_papers]
                 yield format_sse(
                     {
                         "type": "done",
-                        "content": getattr(value, "answer", str(value)),
-                        "sources": [p.model_dump() for p in cited_papers],
+                        "content": final_answer,
+                        "sources": final_sources,
                     }
                 )
+                if on_complete:
+                    await on_complete(
+                        answer=final_answer,
+                        sources=final_sources,
+                        search_query=pre_generated_query,
+                    )
+
+                # Generate and emit title (only when caller requests it)
+                if generate_title:
+                    try:
+                        title = await generate_title(question=question, answer=final_answer)
+                        yield format_sse({"type": "title", "content": title})
+                    except Exception as _te:
+                        logger.warning("[STREAM] Title generation error: %s", _te)
 
         duration_ms = int((time.time() - start_time) * 1000)
         logger.info(

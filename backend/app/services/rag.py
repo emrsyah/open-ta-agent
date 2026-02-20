@@ -2,6 +2,8 @@
 RAG (Retrieval-Augmented Generation) service using DSPy.
 """
 
+import asyncio
+import contextlib
 import logging
 import dspy
 from typing import List, Optional
@@ -43,6 +45,18 @@ class PaperChatSignature(dspy.Signature):
     history: dspy.History = dspy.InputField(desc="Previous conversation turns for context")
     answer: str = dspy.OutputField(desc="Markdown-formatted answer with inline citations [1], [2] after every sentence that references a paper")
     sources: List[str] = dspy.OutputField(desc="List of paper IDs actually cited in the answer, in citation order (e.g. the ID of Paper 1 first if [1] was used, then Paper 2's ID if [2] was used, etc.)")
+
+
+class TitleGenerationSignature(dspy.Signature):
+    """
+    Generate a short, descriptive conversation title.
+    The title should capture the core topic in 4-7 words.
+    Do NOT use generic phrases like 'Research on' or 'Question about'.
+    Return only the title text, no quotes or punctuation at the end.
+    """
+    question: str = dspy.InputField(desc="The user's first question")
+    answer: str = dspy.InputField(desc="The assistant's first answer (summary)")
+    title: str = dspy.OutputField(desc="Concise conversation title, 4-7 words")
 
 
 class IntentClassificationSignature(dspy.Signature):
@@ -336,6 +350,29 @@ class RAGService:
             "search_query": search_query
         }
     
+    async def generate_title(self, question: str, answer: str) -> str:
+        """
+        Generate a short conversation title from the first Q&A turn.
+        Uses cheap_lm to keep cost and latency low.
+        Falls back to truncated question if LLM call fails.
+        """
+        try:
+            predictor = dspy.Predict(TitleGenerationSignature)
+            ctx = dspy.context(lm=self.cheap_lm) if self.cheap_lm else contextlib.nullcontext()
+            with ctx:
+                result = await asyncio.to_thread(
+                    predictor,
+                    question=question,
+                    answer=answer[:500],  # truncate long answers
+                )
+            title = result.title.strip().strip('"').strip("'")
+            logger.info("[RAG] Generated title: '%s'", title)
+            return title
+        except Exception as e:
+            logger.warning("[RAG] Title generation failed: %s", e)
+            q = question.strip()
+            return q[:60].rsplit(" ", 1)[0] + "…" if len(q) > 60 else q
+
     def get_module(self) -> PaperRAG:
         """Get the RAG module for streaming."""
         return self.rag_module

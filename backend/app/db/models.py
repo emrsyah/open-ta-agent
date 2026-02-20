@@ -3,10 +3,14 @@ SQLAlchemy models for Telkom University library catalog.
 Matches the Drizzle ORM schema from the frontend.
 """
 
+from datetime import datetime, timezone
+
 from sqlalchemy import (
-    Column, Integer, String, Text, SmallInteger, Index, Enum as SQLEnum
+    Boolean, Column, DateTime, ForeignKey, Integer, String, Text,
+    SmallInteger, Index, Enum as SQLEnum
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
 from app.database import Base
 import enum
@@ -185,3 +189,52 @@ class Catalog(Base):
             "accessLink": self.access_link,
             "abstract": self.abstract,
         }
+
+
+def _utcnow():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc)
+
+
+class Conversation(Base):
+    """Chat conversation session. One conversation contains many messages."""
+    __tablename__ = "conversations"
+
+    id: Mapped[str] = mapped_column(
+        String(128), primary_key=True,
+        comment="Client-generated conversation ID"
+    )
+    title: Mapped[str | None] = mapped_column(Text, nullable=True, comment="Auto-generated from first question")
+    is_incognito: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow)
+
+    messages: Mapped[list["Message"]] = relationship(
+        "Message", back_populates="conversation",
+        order_by="Message.created_at", cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        Index("conversations_created_at_idx", "created_at", postgresql_using="btree"),
+    )
+
+
+class Message(Base):
+    """Single Q&A turn within a conversation."""
+    __tablename__ = "messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False,
+    )
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[str] = mapped_column(Text, nullable=False)
+    sources: Mapped[list | None] = mapped_column(JSONB, nullable=True, comment="Array of CitedPaper dicts")
+    search_query: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+    conversation: Mapped["Conversation"] = relationship("Conversation", back_populates="messages")
+
+    __table_args__ = (
+        Index("messages_conversation_id_idx", "conversation_id", postgresql_using="btree"),
+    )

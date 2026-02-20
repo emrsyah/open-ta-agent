@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_, and_, text, case
 from sqlalchemy.orm import selectinload
 
-from app.db.models import Catalog, CatalogType
+from app.db.models import Catalog, CatalogType, Conversation, Message
 from app.db.schemas import CatalogCreate, CatalogUpdate, CatalogFilterRequest
 
 logger = logging.getLogger(__name__)
@@ -338,5 +338,113 @@ class CatalogCRUD:
             .where(Catalog.publication_year == year)
             .order_by(Catalog.title)
             .limit(limit)
+        )
+        return list(result.scalars().all())
+
+
+class ConversationCRUD:
+    """CRUD operations for Conversation and Message models."""
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    # ------------------------------------------------------------------
+    # Conversations
+    # ------------------------------------------------------------------
+
+    async def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
+        result = await self.session.execute(
+            select(Conversation).where(Conversation.id == conversation_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def upsert_conversation(
+        self,
+        conversation_id: str,
+        title: Optional[str] = None,
+        is_incognito: bool = False,
+    ) -> Conversation:
+        """Create conversation if it doesn't exist, otherwise return existing."""
+        conv = await self.get_conversation(conversation_id)
+        if conv:
+            return conv
+        conv = Conversation(id=conversation_id, title=title, is_incognito=is_incognito)
+        self.session.add(conv)
+        await self.session.commit()
+        await self.session.refresh(conv)
+        logger.info("[CRUD] Created conversation: %s", conversation_id)
+        return conv
+
+    async def update_conversation_title(self, conversation_id: str, title: str) -> None:
+        conv = await self.get_conversation(conversation_id)
+        if conv:
+            conv.title = title
+            await self.session.commit()
+
+    async def delete_conversation(self, conversation_id: str) -> bool:
+        conv = await self.get_conversation(conversation_id)
+        if not conv:
+            return False
+        await self.session.delete(conv)
+        await self.session.commit()
+        logger.info("[CRUD] Deleted conversation: %s", conversation_id)
+        return True
+
+    # ------------------------------------------------------------------
+    # Messages
+    # ------------------------------------------------------------------
+
+    async def add_message(
+        self,
+        conversation_id: str,
+        question: str,
+        answer: str,
+        sources: Optional[list] = None,
+        search_query: Optional[str] = None,
+    ) -> Message:
+        msg = Message(
+            conversation_id=conversation_id,
+            question=question,
+            answer=answer,
+            sources=sources,
+            search_query=search_query,
+        )
+        self.session.add(msg)
+        await self.session.commit()
+        await self.session.refresh(msg)
+        logger.debug("[CRUD] Added message to conversation: %s", conversation_id)
+        return msg
+
+    async def get_messages(
+        self,
+        conversation_id: str,
+        limit: int = 50,
+    ) -> List[Message]:
+        """Return messages for a conversation ordered by creation time, newest last."""
+        result = await self.session.execute(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at.asc())
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
+    async def get_recent_messages(
+        self,
+        conversation_id: str,
+        last_n: int = 5,
+    ) -> List[Message]:
+        """Return the last N messages for context passing to DSPy."""
+        subq = (
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at.desc())
+            .limit(last_n)
+            .subquery()
+        )
+        result = await self.session.execute(
+            select(Message)
+            .join(subq, Message.id == subq.c.id)
+            .order_by(Message.created_at.asc())
         )
         return list(result.scalars().all())
