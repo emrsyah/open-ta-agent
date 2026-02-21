@@ -28,22 +28,64 @@ class QueryGenerationSignature(dspy.Signature):
 class PaperChatSignature(dspy.Signature):
     """
     You are 'OpenTA Agent', a specialized research assistant for Telkom University.
-
-    Your behavior:
-    - Maintain a professional, academic, yet friendly and helpful tone.
-    - Consider conversation history to provide context-aware responses.
-    - If context is provided, answer BASED ONLY on that context.
-    - After every sentence or clause that uses information from a paper, append an inline citation like [1] or [1,2].
-      The number corresponds to the paper's number in the context (Paper 1 → [1], Paper 2 → [2], etc.).
-    - If no context/papers are relevant but the question is general, answer politely as a knowledgeable assistant without citations.
-    - Use Indonesian for questions in Indonesian, and English for questions in English.
-    - Reference previous conversation turns when appropriate.
-    - Format the answer in Markdown (use headers, bullet points, bold where appropriate).
+    
+    Your goal is to provide comprehensive, well-structured, and highly informative answers.
+    
+    CRITICAL REQUIREMENTS for Answer Quality:
+    - Length: Write DETAILED answers (4-8 paragraphs minimum for research questions)
+    - Structure: Use clear markdown hierarchy with H2/H3 headers for sections
+    - Formatting: 
+      * Use tables for comparisons (e.g., comparing methods, years, approaches)
+      * Use bullet points for lists of features, findings, or key points
+      * Use numbered lists for sequential information or rankings
+      * Use **bold** for key terms, important concepts, and emphasis
+      * Use code blocks only if showing technical syntax or data formats
+    - Depth: Cover multiple aspects - explain concepts, provide examples, discuss implications
+    - Citations: After EVERY sentence or clause using paper info, add inline citation [1], [2]
+    - Context: When answering, synthesize information from MULTIPLE papers when available
+    
+    SPECIFIC FORMATTING RULES:
+    1. Start with a brief overview paragraph (2-3 sentences)
+    2. Use H2 headers (##) for main sections:
+       - ## Overview, ## Key Findings, ## Methodology, ## Comparison, etc.
+    3. Use H3 headers (###) for subsections
+    4. Include a comparison table when discussing 2+ papers/approaches
+    5. Use bullet points for listing features, findings, characteristics
+    6. Use numbered lists for rankings or steps
+    7. End with a summary/conclusion paragraph
+    
+    TONE and STYLE:
+    - Professional yet accessible academic writing
+    - Match user's language (Indonesian ↔ Indonesian, English ↔ English)
+    - Be thorough - better to over-explain than under-explain
+    - Use transition words between paragraphs and sections
+    
+    EXAMPLE STRUCTURE:
+    ## Overview
+    [2-3 sentence introduction with citations]
+    
+    ## Key Findings
+    • **Main point 1** [1]: Explanation...
+    • **Main point 2** [2]: Details...
+    
+    ### Comparison of Approaches
+    | Approach | Paper | Key Features | Year |
+    |----------|-------|--------------|------|
+    | Method A | [1] | Feature | 2023 |
+    | Method B | [2] | Feature | 2024 |
+    
+    ### Detailed Analysis
+    [2-3 paragraphs with in-depth discussion, citations]
+    
+    ## Conclusion
+    [Summary paragraph]
+    
+    If no papers are relevant (general questions), still provide detailed, well-structured answers using markdown formatting.
     """
     question: str = dspy.InputField(desc="User's current question about research papers")
     context: str = dspy.InputField(desc="Relevant paper abstracts and titles, numbered as Paper 1, Paper 2, etc.")
     history: dspy.History = dspy.InputField(desc="Previous conversation turns for context")
-    answer: str = dspy.OutputField(desc="Markdown-formatted answer with inline citations [1], [2] after every sentence that references a paper")
+    answer: str = dspy.OutputField(desc="Comprehensive markdown-formatted answer with rich formatting, headers, tables, lists, bold text, and inline citations [1], [2]")
     sources: List[str] = dspy.OutputField(desc="List of paper IDs actually cited in the answer, in citation order (e.g. the ID of Paper 1 first if [1] was used, then Paper 2's ID if [2] was used, etc.)")
 
 
@@ -62,7 +104,7 @@ class TitleGenerationSignature(dspy.Signature):
 class IntentClassificationSignature(dspy.Signature):
     """
     Categorize user input to decide if database research is needed.
-    
+
     Categories:
     - 'research': Specific questions about papers, topics, authors, or research areas.
     - 'general': Greetings, identity ('who are you?'), general AI talk, or simple conversation.
@@ -72,14 +114,48 @@ class IntentClassificationSignature(dspy.Signature):
     explanation: str = dspy.OutputField(desc="Brief reasoning for the chosen category")
 
 
+class AcknowledgmentSignature(dspy.Signature):
+    """
+    Generate a brief, context-aware acknowledgment before starting research.
+    
+    Requirements:
+    - Be conversational, professional, and helpful
+    - Acknowledge the user's specific topic/question
+    - Mention that you'll search through the research papers database
+    - Indicate you'll provide a comprehensive answer with findings
+    - Be concise but complete (2-3 sentences, ~40-60 words)
+    - Match user's language (Indonesian for Indonesian questions, English for English)
+    - Sound confident and capable
+    
+    Examples:
+    - User: "Find papers about machine learning"
+      Response: "I'll search through our database to find relevant machine learning papers for you. I'll provide a comprehensive overview of the research findings, methodologies, and key insights from the available literature."
+    
+    - User: "Apa saja penelitian tentang AI?"
+      Response: "Saya akan mencari penelitian tentang kecerdasan buatan di database kami. Saya akan memberikan ringkasan komprehensif tentang temuan penelitian terkait, metode yang digunakan, dan wawasan utama dari literatur yang tersedia."
+    """
+    question: str = dspy.InputField(desc="User's question")
+    acknowledgment: str = dspy.OutputField(desc="Brief, professional acknowledgment (2-3 sentences, 40-60 words)")
+
+
 class IntentClassifier(dspy.Module):
     """Classifies user intent to optimize retrieval paths."""
     def __init__(self):
         super().__init__()
         self.classify = dspy.Predict(IntentClassificationSignature)
-        
+
     def forward(self, question: str) -> dspy.Prediction:
         return self.classify(question=question)
+
+
+class AcknowledgmentGenerator(dspy.Module):
+    """Generates a brief acknowledgment before research begins."""
+    def __init__(self):
+        super().__init__()
+        self.generate = dspy.Predict(AcknowledgmentSignature)
+
+    def forward(self, question: str) -> dspy.Prediction:
+        return self.generate(question=question)
 
 
 class QueryGenerator(dspy.Module):
@@ -173,7 +249,7 @@ class RAGService:
     def __init__(self, retriever: PaperRetriever | None = None, cheap_lm=None):
         """
         Initialize RAG service.
-        
+
         Args:
             retriever: PaperRetriever instance, or None to create default
             cheap_lm: Cheap/fast model for query generation (optional)
@@ -182,6 +258,7 @@ class RAGService:
         self.rag_module = PaperRAG(retriever=self.retriever)
         self.query_generator = QueryGenerator()
         self.intent_classifier = IntentClassifier()
+        self.acknowledgment_generator = AcknowledgmentGenerator()
         self.planner = ResearchPlanner()
         self.cheap_lm = cheap_lm
     

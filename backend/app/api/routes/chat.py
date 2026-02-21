@@ -149,6 +149,7 @@ async def chat_basic(request: ChatRequest, background_tasks: BackgroundTasks):
             question=query,
             query_generator=rag_service.query_generator,
             intent_classifier=rag_service.intent_classifier,
+            acknowledgment_generator=rag_service.acknowledgment_generator,
             cheap_lm=rag_service.cheap_lm,
             history=dspy_history,
             language=meta_params.language,

@@ -53,20 +53,33 @@ class SessionManager:
         self.db_client = db_client
         self._redis: Optional[aioredis.Redis] = None
     
-    async def connect(self):
-        """Connect to Redis."""
-        if self._redis is None:
-            self._redis = await aioredis.from_url(
+    async def connect(self) -> bool:
+        """Connect to Redis. Returns False if Redis is unavailable (DB-only mode)."""
+        if self._redis is not None:
+            return True
+        try:
+            client = await aioredis.from_url(
                 self.redis_url,
                 encoding="utf-8",
-                decode_responses=True
+                decode_responses=True,
+                socket_connect_timeout=10,  # Increased for cloud Redis (Upstash)
             )
-            logger.info(f"[SESSION] Connected to Redis at {self.redis_url}")
+            await client.ping()
+            self._redis = client
+            logger.info("[SESSION] Connected to Redis at %s", self.redis_url)
+            return True
+        except Exception as e:
+            logger.warning("[SESSION] Redis unavailable (%s). Running in DB-only mode.", e)
+            self._redis = None
+            return False
     
     async def disconnect(self):
         """Disconnect from Redis."""
-        if self._redis:
-            await self._redis.close()
+        if self._redis is not None:
+            try:
+                await self._redis.close()
+            except Exception:
+                pass
             self._redis = None
             logger.info("[SESSION] Disconnected from Redis")
     
@@ -95,8 +108,8 @@ class SessionManager:
         Returns:
             Session metadata dict
         """
-        await self.connect()
-        
+        redis_ok = await self.connect()
+
         session_metadata = {
             "conversation_id": conversation_id,
             "user_id": user_id,
@@ -105,20 +118,18 @@ class SessionManager:
             "message_count": 0,
             **(metadata or {})
         }
-        
-        # Store metadata
-        meta_key = self._get_metadata_key(conversation_id)
-        await self._redis.setex(
-            meta_key,
-            self.default_ttl,
-            json.dumps(session_metadata)
-        )
-        
-        # Initialize empty message list
-        session_key = self._get_session_key(conversation_id)
-        await self._redis.setex(session_key, self.default_ttl, json.dumps([]))
-        
-        logger.info(f"[SESSION] Created session: {conversation_id}")
+
+        if redis_ok:
+            try:
+                meta_key = self._get_metadata_key(conversation_id)
+                await self._redis.setex(meta_key, self.default_ttl, json.dumps(session_metadata))
+                session_key = self._get_session_key(conversation_id)
+                await self._redis.setex(session_key, self.default_ttl, json.dumps([]))
+            except Exception as e:
+                logger.warning("[SESSION] Redis create_session failed: %s", e)
+                self._redis = None
+
+        logger.info("[SESSION] Created session: %s", conversation_id)
         return session_metadata
     
     async def get_history(
@@ -126,36 +137,33 @@ class SessionManager:
         conversation_id: str,
         limit: Optional[int] = None
     ) -> List[Dict]:
-        """
-        Get conversation history from Redis.
-        
-        Args:
-            conversation_id: Conversation identifier
-            limit: Optional limit on number of messages to return (most recent)
-            
-        Returns:
-            List of conversation messages
-        """
-        await self.connect()
-        
-        session_key = self._get_session_key(conversation_id)
-        data = await self._redis.get(session_key)
-        
-        if not data:
-            logger.info("[SESSION] Redis miss for %s — loading from DB", conversation_id)
-            messages = await self.load_from_database(conversation_id, limit=limit or self.max_messages)
-            if messages:
-                # Warm Redis cache for next request
-                await self._redis.setex(session_key, self.default_ttl, json.dumps(messages))
+        """Get conversation history. Falls back to DB when Redis is unavailable."""
+        redis_ok = await self.connect()
+
+        if not redis_ok:
+            return await self.load_from_database(conversation_id, limit=limit or self.max_messages)
+
+        try:
+            session_key = self._get_session_key(conversation_id)
+            data = await self._redis.get(session_key)
+
+            if not data:
+                logger.info("[SESSION] Redis miss for %s — loading from DB", conversation_id)
+                messages = await self.load_from_database(conversation_id, limit=limit or self.max_messages)
+                if messages:
+                    await self._redis.setex(session_key, self.default_ttl, json.dumps(messages))
+                return messages
+
+            messages = json.loads(data)
+            if limit and len(messages) > limit:
+                messages = messages[-limit:]
+
+            logger.info("[SESSION] Retrieved %d messages for: %s", len(messages), conversation_id)
             return messages
-
-        messages = json.loads(data)
-
-        if limit and len(messages) > limit:
-            messages = messages[-limit:]
-
-        logger.info("[SESSION] Retrieved %d messages for: %s", len(messages), conversation_id)
-        return messages
+        except Exception as e:
+            logger.warning("[SESSION] Redis get failed, falling back to DB: %s", e)
+            self._redis = None
+            return await self.load_from_database(conversation_id, limit=limit or self.max_messages)
     
     async def add_message(
         self,
@@ -166,29 +174,7 @@ class SessionManager:
         context: Optional[str] = None,
         metadata: Optional[Dict] = None
     ) -> bool:
-        """
-        Add a message to conversation history.
-        
-        Args:
-            conversation_id: Conversation identifier
-            question: User's question
-            answer: Assistant's answer
-            sources: Optional list of source paper IDs
-            context: Optional retrieved context
-            metadata: Optional message metadata
-            
-        Returns:
-            True if successful
-        """
-        await self.connect()
-        
-        session_key = self._get_session_key(conversation_id)
-        
-        # Get current history
-        data = await self._redis.get(session_key)
-        messages = json.loads(data) if data else []
-        
-        # Create message entry
+        """Add a message to history. Persists to DB always; Redis is best-effort."""
         message = {
             "question": question,
             "answer": answer,
@@ -197,47 +183,42 @@ class SessionManager:
             "timestamp": datetime.utcnow().isoformat(),
             **(metadata or {})
         }
-        
-        # Add message
-        messages.append(message)
-        
-        # Prune if too long
-        if len(messages) > self.max_messages:
-            logger.info(f"[SESSION] Pruning history for {conversation_id} (keeping last {self.max_messages})")
-            messages = messages[-self.max_messages:]
-        
-        # Save back to Redis
-        await self._redis.setex(
-            session_key,
-            self.default_ttl,
-            json.dumps(messages)
-        )
-        
-        # Update metadata
-        await self._update_metadata(conversation_id, len(messages))
-        
-        logger.info("[SESSION] Added message to %s (total: %d)", conversation_id, len(messages))
 
-        # Always persist to DB for long-term storage
+        redis_ok = await self.connect()
+
+        if redis_ok:
+            try:
+                session_key = self._get_session_key(conversation_id)
+                data = await self._redis.get(session_key)
+                messages = json.loads(data) if data else []
+                messages.append(message)
+                if len(messages) > self.max_messages:
+                    messages = messages[-self.max_messages:]
+                await self._redis.setex(session_key, self.default_ttl, json.dumps(messages))
+                await self._update_metadata(conversation_id, len(messages))
+                logger.info("[SESSION] Added message to %s (total: %d)", conversation_id, len(messages))
+            except Exception as e:
+                logger.warning("[SESSION] Redis write failed: %s. Persisting to DB only.", e)
+                self._redis = None
+
+        # Always persist to DB regardless of Redis state
         await self._save_to_database(conversation_id, message)
-        
         return True
     
     async def _update_metadata(self, conversation_id: str, message_count: int):
-        """Update session metadata."""
-        meta_key = self._get_metadata_key(conversation_id)
-        data = await self._redis.get(meta_key)
-        
-        if data:
-            metadata = json.loads(data)
-            metadata["last_activity"] = datetime.utcnow().isoformat()
-            metadata["message_count"] = message_count
-            
-            await self._redis.setex(
-                meta_key,
-                self.default_ttl,
-                json.dumps(metadata)
-            )
+        """Update session metadata in Redis (best-effort)."""
+        if self._redis is None:
+            return
+        try:
+            meta_key = self._get_metadata_key(conversation_id)
+            data = await self._redis.get(meta_key)
+            if data:
+                metadata = json.loads(data)
+                metadata["last_activity"] = datetime.utcnow().isoformat()
+                metadata["message_count"] = message_count
+                await self._redis.setex(meta_key, self.default_ttl, json.dumps(metadata))
+        except Exception:
+            pass
     
     async def get_metadata(self, conversation_id: str) -> Optional[Dict]:
         """Get conversation metadata."""

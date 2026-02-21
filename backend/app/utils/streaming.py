@@ -166,6 +166,7 @@ async def stream_dspy_response(
     question: str,
     query_generator: Any = None,
     intent_classifier: Any = None,
+    acknowledgment_generator: Any = None,
     cheap_lm: Any = None,
     history: Any = None,
     language: str = "en-US",
@@ -206,8 +207,15 @@ async def stream_dspy_response(
 
     try:
         # ------------------------------------------------------------------ #
-        # 1. Classify intent + pre-generate query in parallel                 #
+        # 1. Show thinking state (shimmer in UI)                             #
         # ------------------------------------------------------------------ #
+        yield format_sse(
+            {"type": "simple_thinking", "message": "OpenTA is thinking..."}
+        )
+
+        # ------------------------------------------------------------------ #
+        # 2. Classify intent + pre-generate query in parallel                 #
+        # ------------------------------------------------------------------
         yield format_sse(
             {"type": "status", "step": "classifying", "message": "Understanding your question..."}
         )
@@ -248,6 +256,28 @@ async def stream_dspy_response(
                 ),
             }
         )
+
+        # ------------------------------------------------------------------ #
+        # 2b. Generate acknowledgment for research questions                 #
+        # ------------------------------------------------------------------ #
+        if is_research and acknowledgment_generator:
+            try:
+                acknowledgment_result = await _run_dspy_sync(
+                    acknowledgment_generator,
+                    cheap_lm=cheap_lm,
+                    question=question
+                )
+                if acknowledgment_result:
+                    acknowledgment = getattr(acknowledgment_result, 'acknowledgment', '')
+                    if acknowledgment:
+                        logger.info("[STREAM] Generated acknowledgment for research question")
+                        yield format_sse({
+                            "type": "acknowledgment",
+                            "content": acknowledgment
+                        })
+            except Exception as e:
+                logger.warning("[STREAM] Failed to generate acknowledgment: %s", e)
+                # Continue without acknowledgment - not critical
 
         # ------------------------------------------------------------------ #
         # 2. General questions: skip planning entirely, go straight to answer #
