@@ -1,9 +1,12 @@
 # Paper Research Platform - FastAPI + DSPy Backend
 # Telkom University Paper Research API
 
+# COMMON PYTHON UTILITIES
+packaging
+
 # Web Framework
 fastapi
-uvicorn
+uvicorn[standard]
 
 # Data Validation
 pydantic
@@ -11,6 +14,13 @@ pydantic-settings
 
 # AI Framework
 dspy-ai
+
+# Additional dependencies for DSPy
+litellm[proxy]
+
+# HTTP client (required by DSPy for some operations)
+httpx
+httpx-sse  # For server-sent events streaming support
 
 # JSON Processing (faster than standard json)
 orjson
@@ -32,3 +42,7 @@ voyageai
 
 # Redis (for conversation session management)
 redis[hiredis]>=5.0.0
+
+# Additional utilities that may be needed
+python-multipart  # For file uploads (if needed)
+aiofiles  # For async file operations
