@@ -11,6 +11,7 @@ pydantic-settings
 
 # AI Framework
 dspy-ai
+packaging  # Required by litellm (dspy-ai dependency)
 
 # JSON Processing (faster than standard json)
 orjson

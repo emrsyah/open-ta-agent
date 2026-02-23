@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # CACHE BUST: Add timestamp to force rebuild
-# Last updated: 2025-02-23-22:50:00 to fix packaging module issue
+# Last updated: 2026-02-23-23:20:00 to add explicit packaging dependency
 RUN echo "Cache bust: $(date +%s)" > /tmp/cachebust
 
 # Copy requirements file
