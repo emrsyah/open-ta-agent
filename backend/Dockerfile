@@ -14,15 +14,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# CACHE BUST: Add timestamp to force rebuild
-# Last updated: 2026-02-23-23:20:00 to add explicit packaging dependency
-RUN echo "Cache bust: $(date +%s)" > /tmp/cachebust
+# CACHE BUST: Change this value to force a full pip reinstall
+RUN echo "cachebust-2026-02-23-23:32" > /tmp/cachebust
 
 # Copy requirements file
 COPY requirements.txt .
 
 # Install Python dependencies to a temporary location
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir --prefix=/install packaging && \
     pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # Stage 2: Runtime - Minimal production image
