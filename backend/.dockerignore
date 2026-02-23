@@ -1,0 +1,92 @@
+# .dockerignore - Files to exclude from Docker build context
+# This reduces build time and image size
+
+# Git
+.git
+.gitignore
+.github
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
+venv
+.venv
+env
+ENV
+env.bak
+venv.bak
+.pytest_cache
+.coverage
+htmlcov
+.mypy_cache
+
+# IDEs
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Documentation
+README.md
+docs/
+*.md
+LICENSE
+
+# Testing
+tests/
+.pytest_cache/
+coverage.xml
+*.cover
+
+# Logs
+*.log
+logs/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Data
+data/
+*.json
+!requirements.txt
+
+# Alembic (migrations will be in image)
+# alembic/versions/*.py
+alembic.ini
+
+# Frontend (if separate)
+frontend/
+node_modules/
+npm-debug.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# CI/CD
+.gitlab-ci.yml
+.travis.yml
+azure-pipelines.yml
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore

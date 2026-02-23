@@ -1,0 +1,341 @@
+# GitHub Actions CI/CD Pipeline for OpenTA Backend on Render.com
+# This workflow tests, builds, and deploys your application to Render
+
+name: CI/CD - Deploy to Render
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+    inputs:
+      deploy_environment:
+        description: 'Deploy environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+# Environment variables
+env:
+  PYTHON_VERSION: "3.11"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ============================================
+  # Job 1: Lint and Type Check
+  # ============================================
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        working-directory: ./backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff mypy pytest pytest-asyncio httpx
+          pip install -r requirements.txt
+
+      - name: Run Ruff linter
+        working-directory: ./backend
+        run: |
+          ruff check . --output-format=github
+          ruff format --check .
+
+      - name: Type check with mypy
+        working-directory: ./backend
+        run: mypy app/ --ignore-missing-imports
+        continue-on-error: true
+
+  # ============================================
+  # Job 2: Run Tests
+  # ============================================
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: lint
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        working-directory: ./backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-asyncio pytest-cov httpx
+          pip install -r requirements.txt
+
+      - name: Run Alembic migrations
+        working-directory: ./backend
+        env:
+          DATABASE_URL: postgresql+asyncpg://test_user:test_password@localhost:5432/test_db
+        run: |
+          alembic upgrade head
+
+      - name: Run tests with coverage
+        working-directory: ./backend
+        env:
+          DATABASE_URL: postgresql+asyncpg://test_user:test_password@localhost:5432/test_db
+          REDIS_URL: redis://localhost:6379
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
+        run: |
+          pytest tests/ \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --verbose \
+            --tb=short
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./backend/coverage.xml
+          flags: backend
+          fail_ci_if_error: false
+
+  # ============================================
+  # Job 3: Build Docker Image
+  # ============================================
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tag: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Export image digest
+        run: echo "Digest=${{ steps.build.outputs.digest }}"
+
+  # ============================================
+  # Job 4: Deploy to Render (via Blueprint)
+  # ============================================
+  deploy:
+    name: Deploy to Render
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Render CLI
+        run: |
+          npm install -g render-cli
+
+      - name: Deploy via Render Blueprint
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        run: |
+          echo "Deployment triggered on Render.com"
+          echo "Check deployment status at https://dashboard.render.com"
+
+      - name: Wait for deployment to complete
+        env:
+          RENDER_SERVICE_URL: ${{ secrets.RENDER_SERVICE_URL }}
+        run: |
+          echo "Waiting for deployment to complete..."
+          sleep 60
+          
+          MAX_ATTEMPTS=30
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            if curl -f -s "${{ secrets.RENDER_SERVICE_URL }}/health" > /dev/null 2>&1; then
+              echo "Deployment successful!"
+              echo "Live at: ${{ secrets.RENDER_SERVICE_URL }}"
+              exit 0
+            fi
+            
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: Waiting for service..."
+            sleep 10
+          done
+          
+          echo "Deployment failed or timed out"
+          exit 1
+
+      - name: Notify deployment status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "Deployment completed successfully!"
+          else
+            echo "Deployment failed. Check logs on Render dashboard"
+          fi
+
+  # # ============================================
+  # # Job 5: Smoke Tests (Post-Deployment)
+  # # ============================================
+  # smoke-test:
+  #   name: Smoke Tests
+  #   runs-on: ubuntu-latest
+  #   needs: deploy
+  #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+
+  #     - name: Set up Python
+  #       uses: actions/setup-python@v5
+  #       with:
+  #         python-version: ${{ env.PYTHON_VERSION }}
+
+  #     - name: Install test dependencies
+  #       run: pip install httpx
+
+  #     - name: Run smoke tests
+  #       env:
+  #         API_URL: ${{ secrets.RENDER_SERVICE_URL }}
+  #       run: |
+  #         pip install httpx
+  #         python -c "
+  #         import httpx
+  #         import os
+  #         import sys
+          
+  #         API_URL = os.getenv('API_URL', 'https://openta-backend.onrender.com')
+          
+  #         try:
+  #             response = httpx.get(f'{API_URL}/health', timeout=10.0)
+  #             assert response.status_code == 200
+  #             data = response.json()
+  #             assert data['status'] == 'healthy'
+  #             print('Health check passed')
+              
+  #             response = httpx.get(f'{API_URL}/', timeout=10.0)
+  #             assert response.status_code == 200
+  #             print('API info check passed')
+              
+  #             response = httpx.get(f'{API_URL}/papers/list?limit=5', timeout=30.0)
+  #             assert response.status_code == 200
+  #             print('Papers list check passed')
+              
+  #             print('All smoke tests passed!')
+  #         except Exception as e:
+  #             print(f'Smoke test failed: {e}')
+  #             sys.exit(1)
+  #         "
+
+  # ============================================
+  # Job 6: Security Scan
+  # ============================================
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build.outputs.image-tag }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run pip-audit
+        working-directory: ./backend
+        run: |
+          pip install pip-audit
+          pip-audit --desc --format json > pip-audit-report.json || true
+        continue-on-error: true

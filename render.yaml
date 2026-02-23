@@ -1,0 +1,174 @@
+# Render.com Blueprint Configuration for OpenTA Backend
+# Uses external Supabase (PostgreSQL) and Upstash (Redis)
+
+services:
+  # Web Service - FastAPI Backend
+  - type: web
+    name: openta-backend
+    env: docker
+    region: singapore # Options: oregon, frankfurt, singapore, sydney
+    plan: free # Options: free, starter, standard, pro
+    runtime: docker
+
+    # Docker configuration
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+
+    # Health check
+    healthCheckPath: /health
+
+    # Environment variables
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+
+      - key: PORT
+        value: "8000"
+
+      # =============================================================================
+      # EXTERNAL DATABASE - Supabase (NOT created by Render)
+      # =============================================================================
+      # Get your connection string from Supabase Dashboard → Settings → Database
+      # Format: postgresql+asyncpg://postgres:[password]@db.[project-ref].supabase.co:5432/postgres
+      - key: DATABASE_URL
+        value: "postgresql+asyncpg://postgres:YOUR_PASSWORD@db.YOUR_PROJECT_REF.supabase.co:5432/postgres"
+        # IMPORTANT: Replace with your actual Supabase connection string in Render dashboard!
+
+      # =============================================================================
+      # EXTERNAL REDIS - Upstash (NOT created by Render)
+      # =============================================================================
+      # Get your Redis URL from Upstash Dashboard → REST API → Redis URL
+      # Format: redis://default:[password]@your-redis-url.upstash.io:6379
+      - key: REDIS_URL
+        value: "redis://default:YOUR_PASSWORD@YOUR_REDIS.upstash.io:6379"
+        # IMPORTANT: Replace with your actual Upstash Redis URL in Render dashboard!
+
+      # =============================================================================
+      # API Keys (Set these in Render dashboard for security)
+      # =============================================================================
+      - key: OPENROUTER_API_KEY
+        sync: false # Manually set in dashboard
+
+      - key: VOYAGE_API_KEY
+        sync: false # Manually set in dashboard
+
+      # =============================================================================
+      # Application Settings
+      # =============================================================================
+      - key: APP_NAME
+        value: "OpenTA API"
+
+      - key: APP_VERSION
+        value: "1.0.0"
+
+      - key: APP_DESCRIPTION
+        value: "AI-powered paper research platform for Telkom University"
+
+      - key: DEBUG
+        value: "false"
+
+      - key: HOST
+        value: "0.0.0.0"
+
+      # =============================================================================
+      # DSPy Configuration
+      # =============================================================================
+      - key: DSPY_MODEL
+        value: "openrouter/google/gemini-2.5-pro-preview"
+
+      - key: DSPY_CHEAP_MODEL
+        value: "openrouter/openai/gpt-4o-mini"
+
+      - key: DSPY_MAX_WORKERS
+        value: "4"
+
+      # =============================================================================
+      # OpenRouter Configuration
+      # =============================================================================
+      - key: OPENROUTER_BASE_URL
+        value: "https://openrouter.ai/api/v1"
+
+      # =============================================================================
+      # Retrieval Configuration
+      # =============================================================================
+      - key: RETRIEVAL_TOP_K
+        value: "3"
+
+      - key: EMBEDDING_MODEL
+        value: "voyage-4-lite"
+
+      - key: EMBEDDING_DIM
+        value: "1024"
+
+      # =============================================================================
+      # Database Pool Settings
+      # =============================================================================
+      - key: DB_POOL_SIZE
+        value: "5"
+
+      - key: DB_MAX_OVERFLOW
+        value: "10"
+
+      - key: DB_POOL_TIMEOUT
+        value: "30"
+
+      - key: DB_POOL_RECYCLE
+        value: "1800"
+
+      # =============================================================================
+      # Session Configuration (for Upstash Redis)
+      # =============================================================================
+      - key: SESSION_TTL
+        value: "3600"
+
+      - key: MAX_MESSAGES_PER_SESSION
+        value: "50"
+
+      # =============================================================================
+      # CORS Origins (update with your frontend URL)
+      # =============================================================================
+      - key: CORS_ORIGINS_STR
+        value: "https://openta-frontend.onrender.com,https://your-custom-domain.com"
+
+    # Auto-deploy on git push
+    branch: main
+
+    # Build and runtime settings
+    numInstances: 1
+
+    # Disk storage (if needed)
+    # disk:
+    #   name: data
+    #   mountPath: /app/data
+    #   sizeGB: 1
+
+# =============================================================================
+# IMPORTANT NOTES:
+# =============================================================================
+#
+# This blueprint ONLY creates the web service on Render.
+# You must provide your own Supabase and Upstash instances.
+#
+# SETUP INSTRUCTIONS:
+#
+# 1. SUPABASE SETUP:
+#    - Create account at https://supabase.com
+#    - Create new project
+#    - Enable pgvector extension in SQL Editor:
+#      CREATE EXTENSION IF NOT EXISTS vector;
+#    - Run Alembic migrations to create tables
+#    - Get DATABASE_URL from Settings → Database → Connection String
+#    - Add DATABASE_URL to Render environment variables
+#
+# 2. UPSTASH SETUP:
+#    - Create account at https://upstash.com
+#    - Create new Redis database
+#    - Get Redis URL from Dashboard → REST API
+#    - Add REDIS_URL to Render environment variables
+#
+# 3. RENDER SETUP:
+#    - Go to Render Dashboard → New → Blueprint
+#    - Connect your GitHub repository
+#    - Update DATABASE_URL and REDIS_URL in environment variables
+#    - Click "Apply Blueprint"
+# =============================================================================
