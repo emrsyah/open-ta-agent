@@ -133,77 +133,79 @@ class SessionManager:
         return session_metadata
     
     async def get_history(
-        self,
-        conversation_id: str,
-        limit: Optional[int] = None
-    ) -> List[Dict]:
-        """Get conversation history. Falls back to DB when Redis is unavailable."""
-        redis_ok = await self.connect()
-
-        if not redis_ok:
-            return await self.load_from_database(conversation_id, limit=limit or self.max_messages)
-
-        try:
-            session_key = self._get_session_key(conversation_id)
-            data = await self._redis.get(session_key)
-
-            if not data:
-                logger.info("[SESSION] Redis miss for %s — loading from DB", conversation_id)
-                messages = await self.load_from_database(conversation_id, limit=limit or self.max_messages)
-                if messages:
-                    await self._redis.setex(session_key, self.default_ttl, json.dumps(messages))
-                return messages
-
-            messages = json.loads(data)
-            if limit and len(messages) > limit:
-                messages = messages[-limit:]
-
-            logger.info("[SESSION] Retrieved %d messages for: %s", len(messages), conversation_id)
-            return messages
-        except Exception as e:
-            logger.warning("[SESSION] Redis get failed, falling back to DB: %s", e)
-            self._redis = None
-            return await self.load_from_database(conversation_id, limit=limit or self.max_messages)
+            self,
+            conversation_id: str,
+            limit: Optional[int] = None,
+            user_id: Optional[str] = None,
+        ) -> List[Dict]:
+            """Get conversation history. Falls back to DB when Redis is unavailable."""
+            redis_ok = await self.connect()
     
-    async def add_message(
-        self,
-        conversation_id: str,
-        question: str,
-        answer: str,
-        sources: Optional[List[str]] = None,
-        context: Optional[str] = None,
-        metadata: Optional[Dict] = None
-    ) -> bool:
-        """Add a message to history. Persists to DB always; Redis is best-effort."""
-        message = {
-            "question": question,
-            "answer": answer,
-            "sources": sources or [],
-            "context": context,
-            "timestamp": datetime.utcnow().isoformat(),
-            **(metadata or {})
-        }
-
-        redis_ok = await self.connect()
-
-        if redis_ok:
+            if not redis_ok:
+                return await self.load_from_database(conversation_id, limit=limit or self.max_messages, user_id=user_id)
+    
             try:
                 session_key = self._get_session_key(conversation_id)
                 data = await self._redis.get(session_key)
-                messages = json.loads(data) if data else []
-                messages.append(message)
-                if len(messages) > self.max_messages:
-                    messages = messages[-self.max_messages:]
-                await self._redis.setex(session_key, self.default_ttl, json.dumps(messages))
-                await self._update_metadata(conversation_id, len(messages))
-                logger.info("[SESSION] Added message to %s (total: %d)", conversation_id, len(messages))
+    
+                if not data:
+                    logger.info("[SESSION] Redis miss for %s — loading from DB", conversation_id)
+                    messages = await self.load_from_database(conversation_id, limit=limit or self.max_messages, user_id=user_id)
+                    if messages:
+                        await self._redis.setex(session_key, self.default_ttl, json.dumps(messages))
+                    return messages
+    
+                messages = json.loads(data)
+                if limit and len(messages) > limit:
+                    messages = messages[-limit:]
+    
+                logger.info("[SESSION] Retrieved %d messages for: %s", len(messages), conversation_id)
+                return messages
             except Exception as e:
-                logger.warning("[SESSION] Redis write failed: %s. Persisting to DB only.", e)
+                logger.warning("[SESSION] Redis get failed, falling back to DB: %s", e)
                 self._redis = None
-
-        # Always persist to DB regardless of Redis state
-        await self._save_to_database(conversation_id, message)
-        return True
+                return await self.load_from_database(conversation_id, limit=limit or self.max_messages, user_id=user_id)
+    
+    async def add_message(
+            self,
+            conversation_id: str,
+            question: str,
+            answer: str,
+            sources: Optional[List[str]] = None,
+            context: Optional[str] = None,
+            metadata: Optional[Dict] = None,
+            user_id: Optional[str] = None,
+        ) -> bool:
+            """Add a message to history. Persists to DB always; Redis is best-effort."""
+            message = {
+                "question": question,
+                "answer": answer,
+                "sources": sources or [],
+                "context": context,
+                "timestamp": datetime.utcnow().isoformat(),
+                **(metadata or {})
+            }
+    
+            redis_ok = await self.connect()
+    
+            if redis_ok:
+                try:
+                    session_key = self._get_session_key(conversation_id)
+                    data = await self._redis.get(session_key)
+                    messages = json.loads(data) if data else []
+                    messages.append(message)
+                    if len(messages) > self.max_messages:
+                        messages = messages[-self.max_messages:]
+                    await self._redis.setex(session_key, self.default_ttl, json.dumps(messages))
+                    await self._update_metadata(conversation_id, len(messages))
+                    logger.info("[SESSION] Added message to %s (total: %d)", conversation_id, len(messages))
+                except Exception as e:
+                    logger.warning("[SESSION] Redis write failed: %s. Persisting to DB only.", e)
+                    self._redis = None
+    
+            # Always persist to DB regardless of Redis state
+            await self._save_to_database(conversation_id, message, user_id=user_id)
+            return True
     
     async def _update_metadata(self, conversation_id: str, message_count: int):
         """Update session metadata in Redis (best-effort)."""
@@ -302,66 +304,76 @@ class SessionManager:
         
         return 0
     
-    async def _save_to_database(self, conversation_id: str, message: Dict) -> None:
-        """Persist a single message turn to Supabase via ConversationCRUD."""
-        from app.database import get_session_factory
-        from app.db.crud import ConversationCRUD
+    async def _save_to_database(
+            self, conversation_id: str, message: Dict, user_id: Optional[str] = None
+        ) -> None:
+            """Persist a single message turn to Supabase via ConversationCRUD."""
+            from app.database import get_session_factory
+            from app.db.crud import ConversationCRUD
+    
+            factory = get_session_factory()
+            if factory is None:
+                return
+    
+            try:
+                async with factory() as session:
+                    crud = ConversationCRUD(session)
+                    # Ensure conversation row exists
+                    await crud.upsert_conversation(
+                        conversation_id=conversation_id,
+                        title=message.get("title"),
+                        is_incognito=message.get("is_incognito", False),
+                        user_id=user_id,
+                    )
+                    await crud.add_message(
+                        conversation_id=conversation_id,
+                        question=message["question"],
+                        answer=message["answer"],
+                        sources=message.get("sources"),
+                        search_query=message.get("search_query"),
+                    )
+                logger.debug("[SESSION] Persisted message to DB for conversation: %s", conversation_id)
+            except Exception as e:
+                logger.warning("[SESSION] DB save failed for %s: %s", conversation_id, e)
 
-        factory = get_session_factory()
-        if factory is None:
-            return
-
-        try:
-            async with factory() as session:
-                crud = ConversationCRUD(session)
-                # Ensure conversation row exists
-                await crud.upsert_conversation(
-                    conversation_id=conversation_id,
-                    title=message.get("title"),
-                    is_incognito=message.get("is_incognito", False),
-                )
-                await crud.add_message(
-                    conversation_id=conversation_id,
-                    question=message["question"],
-                    answer=message["answer"],
-                    sources=message.get("sources"),
-                    search_query=message.get("search_query"),
-                )
-            logger.debug("[SESSION] Persisted message to DB for conversation: %s", conversation_id)
-        except Exception as e:
-            logger.warning("[SESSION] DB save failed for %s: %s", conversation_id, e)
-
-    async def load_from_database(self, conversation_id: str, limit: int = 50) -> List[Dict]:
-        """
-        Load conversation history from Supabase.
-        Called when Redis has no entry (expired or first load on new instance).
-        """
-        from app.database import get_session_factory
-        from app.db.crud import ConversationCRUD
-
-        factory = get_session_factory()
-        if factory is None:
-            return []
-
-        try:
-            async with factory() as session:
-                crud = ConversationCRUD(session)
-                messages = await crud.get_messages(conversation_id, limit=limit)
-                result = [
-                    {
-                        "question": m.question,
-                        "answer": m.answer,
-                        "sources": m.sources or [],
-                        "search_query": m.search_query,
-                        "timestamp": m.created_at.isoformat(),
-                    }
-                    for m in messages
-                ]
-            logger.info("[SESSION] Loaded %d messages from DB for: %s", len(result), conversation_id)
-            return result
-        except Exception as e:
-            logger.warning("[SESSION] DB load failed for %s: %s", conversation_id, e)
-            return []
+    async def load_from_database(
+            self, conversation_id: str, limit: int = 50, user_id: Optional[str] = None
+        ) -> List[Dict]:
+            """
+            Load conversation history from Supabase.
+            Called when Redis has no entry (expired or first load on new instance).
+            """
+            from app.database import get_session_factory
+            from app.db.crud import ConversationCRUD
+    
+            factory = get_session_factory()
+            if factory is None:
+                return []
+    
+            try:
+                async with factory() as session:
+                    crud = ConversationCRUD(session)
+                    # Verify ownership if user_id provided
+                    conv = await crud.get_conversation(conversation_id, user_id=user_id)
+                    if not conv:
+                        logger.warning("[SESSION] Conversation not found or access denied: %s", conversation_id)
+                        return []
+                    messages = await crud.get_messages(conversation_id, limit=limit)
+                    result = [
+                        {
+                            "question": m.question,
+                            "answer": m.answer,
+                            "sources": m.sources or [],
+                            "search_query": m.search_query,
+                            "timestamp": m.created_at.isoformat(),
+                        }
+                        for m in messages
+                    ]
+                logger.info("[SESSION] Loaded %d messages from DB for: %s", len(result), conversation_id)
+                return result
+            except Exception as e:
+                logger.warning("[SESSION] DB load failed for %s: %s", conversation_id, e)
+                return []
 
     async def sync_to_database(self, conversation_id: str) -> bool:
         """Sync all Redis messages for a conversation to the database."""

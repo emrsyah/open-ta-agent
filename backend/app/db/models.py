@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     Boolean, Column, DateTime, ForeignKey, Integer, String, Text,
-    SmallInteger, Index, Enum as SQLEnum
+    SmallInteger, BigInteger, Index, Enum as SQLEnum
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -196,6 +196,119 @@ def _utcnow():
     return datetime.now(timezone.utc)
 
 
+class User(Base):
+    """User account for authentication."""
+    __tablename__ = "user"
+
+    id: Mapped[str] = mapped_column(
+        String(255),
+        primary_key=True,
+        comment="User ID (typically UUID)"
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    email: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        unique=True,
+    )
+    email_verified: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+    )
+    image: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False),
+        nullable=False,
+        default=_utcnow,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False),
+        nullable=False,
+        default=_utcnow,
+        onupdate=_utcnow,
+    )
+
+    conversations: Mapped[list["Conversation"]] = relationship(
+        "Conversation", back_populates="user", cascade="all, delete-orphan",
+    )
+
+    def __repr__(self) -> str:
+        return f"<User(id={self.id}, email='{self.email}')>"
+
+
+class Verification(Base):
+    """Email/code verification tokens."""
+    __tablename__ = "verification"
+
+    id: Mapped[str] = mapped_column(
+        Text,
+        primary_key=True,
+        comment="Verification ID (typically UUID)"
+    )
+    identifier: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        comment="Email or identifier to verify"
+    )
+    value: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        comment="Verification code or token"
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False),
+        nullable=False,
+        comment="Token expiration timestamp"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False),
+        nullable=False,
+        default=_utcnow,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False),
+        nullable=False,
+        default=_utcnow,
+        onupdate=_utcnow,
+    )
+
+    __table_args__ = (
+        Index("verification_identifier_idx", "identifier", postgresql_using="btree"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Verification(id={self.id}, identifier='{self.identifier}')>"
+
+
+class RateLimit(Base):
+    """API rate limiting tracking."""
+    __tablename__ = "rate_limit"
+
+    id: Mapped[str] = mapped_column(
+        Text,
+        primary_key=True,
+    )
+    key: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        unique=True,
+        comment="Rate limit key (e.g., user_id or IP address)"
+    )
+    count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        comment="Request count"
+    )
+    last_request: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        comment="Unix timestamp of last request"
+    )
+
+    def __repr__(self) -> str:
+        return f"<RateLimit(id={self.id}, key='{self.key}', count={self.count})>"
 class Conversation(Base):
     """Chat conversation session. One conversation contains many messages."""
     __tablename__ = "conversations"
@@ -203,6 +316,12 @@ class Conversation(Base):
     id: Mapped[str] = mapped_column(
         String(128), primary_key=True,
         comment="Client-generated conversation ID"
+    )
+    user_id: Mapped[str | None] = mapped_column(
+        String(255),
+        ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=True,
+        comment="Optional user ID for authenticated conversations"
     )
     title: Mapped[str | None] = mapped_column(Text, nullable=True, comment="Auto-generated from first question")
     is_incognito: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -214,7 +333,10 @@ class Conversation(Base):
         order_by="Message.created_at", cascade="all, delete-orphan",
     )
 
+    user: Mapped["User"] = relationship("User", back_populates="conversations")
+
     __table_args__ = (
+        Index("conversations_user_id_idx", "user_id", postgresql_using="btree"),
         Index("conversations_created_at_idx", "created_at", postgresql_using="btree"),
     )
 

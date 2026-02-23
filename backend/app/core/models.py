@@ -107,6 +107,7 @@ class ChatMetaParams(BaseModel):
     )
 
 
+
 class ChatRequest(BaseModel):
     """Chat request with query and metadata parameters."""
     query: str = Field(..., min_length=1, description="User's question or message")
@@ -152,6 +153,7 @@ class ChatRequest(BaseModel):
         if self.mode is not None:
             return self.mode
         return self.meta_params.mode
+
 
 
 class CitedPaper(BaseModel):

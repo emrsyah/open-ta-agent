@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: Optional[str] = None
     VOYAGE_API_KEY: Optional[str] = None
     
+    # JWT Authentication (shared secret with Next.js frontend)
+    JWT_SECRET: Optional[str] = None,
+    JWT_ALGORITHM: str = "HS256",
+    JWT_EXPIRATION_MINUTES: int = 5
+    
     # OpenRouter Configuration
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     

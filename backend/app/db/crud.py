@@ -352,43 +352,62 @@ class ConversationCRUD:
     # Conversations
     # ------------------------------------------------------------------
 
-    async def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
-        result = await self.session.execute(
-            select(Conversation).where(Conversation.id == conversation_id)
-        )
-        return result.scalar_one_or_none()
+    async def get_conversation(
+            self, conversation_id: str, user_id: Optional[str] = None
+        ) -> Optional[Conversation]:
+            """Get a conversation by ID. Optionally verify user ownership."""
+            query = select(Conversation).where(Conversation.id == conversation_id)
+            if user_id:
+                query = query.where(Conversation.user_id == user_id)
+            result = await self.session.execute(query)
+            return result.scalar_one_or_none()
 
     async def upsert_conversation(
-        self,
-        conversation_id: str,
-        title: Optional[str] = None,
-        is_incognito: bool = False,
-    ) -> Conversation:
-        """Create conversation if it doesn't exist, otherwise return existing."""
-        conv = await self.get_conversation(conversation_id)
-        if conv:
-            return conv
-        conv = Conversation(id=conversation_id, title=title, is_incognito=is_incognito)
-        self.session.add(conv)
-        await self.session.commit()
-        await self.session.refresh(conv)
-        logger.info("[CRUD] Created conversation: %s", conversation_id)
-        return conv
-
-    async def update_conversation_title(self, conversation_id: str, title: str) -> None:
-        conv = await self.get_conversation(conversation_id)
-        if conv:
-            conv.title = title
+            self,
+            conversation_id: str,
+            title: Optional[str] = None,
+            is_incognito: bool = False,
+            user_id: Optional[str] = None,
+        ) -> Conversation:
+            """Create conversation if it doesn't exist, otherwise return existing.
+    
+            If user_id is provided, verifies ownership on existing conversation.
+            """
+            conv = await self.get_conversation(conversation_id, user_id=user_id)
+            if conv:
+                return conv
+            conv = Conversation(
+                id=conversation_id,
+                title=title,
+                is_incognito=is_incognito,
+                user_id=user_id,
+            )
+            self.session.add(conv)
             await self.session.commit()
+            await self.session.refresh(conv)
+            logger.info("[CRUD] Created conversation: %s (user_id=%s)", conversation_id, user_id)
+            return conv
 
-    async def delete_conversation(self, conversation_id: str) -> bool:
-        conv = await self.get_conversation(conversation_id)
-        if not conv:
-            return False
-        await self.session.delete(conv)
-        await self.session.commit()
-        logger.info("[CRUD] Deleted conversation: %s", conversation_id)
-        return True
+    async def update_conversation_title(
+            self, conversation_id: str, title: str, user_id: Optional[str] = None
+        ) -> None:
+            """Update conversation title. Optionally verify user ownership."""
+            conv = await self.get_conversation(conversation_id, user_id=user_id)
+            if conv:
+                conv.title = title
+                await self.session.commit()
+
+    async def delete_conversation(
+            self, conversation_id: str, user_id: Optional[str] = None
+        ) -> bool:
+            """Delete a conversation. Optionally verify user ownership."""
+            conv = await self.get_conversation(conversation_id, user_id=user_id)
+            if not conv:
+                return False
+            await self.session.delete(conv)
+            await self.session.commit()
+            logger.info("[CRUD] Deleted conversation: %s (user_id=%s)", conversation_id, user_id)
+            return True
 
     # ------------------------------------------------------------------
     # Messages

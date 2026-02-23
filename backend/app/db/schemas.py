@@ -63,6 +63,76 @@ class CatalogListResponse(BaseModel):
     pages: int
 
 
+# User schemas
+class UserBase(BaseModel):
+    """Base user schema with common fields."""
+    name: str
+    email: str
+    email_verified: bool = False
+    image: Optional[str] = None
+
+
+class UserCreate(UserBase):
+    """Schema for creating a new user (includes password)."""
+    password: str = Field(..., min_length=8, max_length=100)
+
+
+class UserUpdate(BaseModel):
+    """Schema for updating user information (all fields optional)."""
+    name: Optional[str] = None
+    email: Optional[str] = None
+    email_verified: Optional[bool] = None
+    image: Optional[str] = None
+
+
+class UserResponse(UserBase):
+    """Schema for user API responses."""
+    id: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# Verification schemas
+class VerificationBase(BaseModel):
+    """Base verification schema with common fields."""
+    identifier: str
+    value: str
+    expires_at: datetime
+
+
+class VerificationCreate(VerificationBase):
+    """Schema for creating a new verification token."""
+    id: Optional[str] = None
+
+
+class VerificationResponse(VerificationBase):
+    """Schema for verification API responses."""
+    id: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# Rate limit schemas
+class RateLimitBase(BaseModel):
+    """Base rate limit schema with common fields."""
+    key: str
+    count: int
+    last_request: int
+
+
+class RateLimitResponse(RateLimitBase):
+    """Schema for rate limit API responses."""
+    id: str
+
+    class Config:
+        from_attributes = True
+
 # Search-specific schemas
 class CatalogSearchRequest(BaseModel):
     """Request schema for searching catalogs."""
@@ -105,3 +175,66 @@ class CatalogFilterRequest(BaseModel):
     offset: int = Field(default=0, ge=0)
     sort_by: str = Field(default="publication_year", pattern="^(title|publication_year|author|id)$")
     sort_order: str = Field(default="desc", pattern="^(asc|desc)$")
+
+
+
+# Conversation and Message schemas
+class MessageBase(BaseModel):
+    """Base message schema with common fields."""
+    question: str
+    answer: str
+    sources: Optional[list] = None
+    search_query: Optional[str] = None
+
+
+class MessageCreate(MessageBase):
+    """Schema for creating a new message."""
+    conversation_id: str
+
+
+class MessageResponse(MessageBase):
+    """Schema for message API responses."""
+    id: int
+    conversation_id: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ConversationBase(BaseModel):
+    """Base conversation schema with common fields."""
+    title: Optional[str] = None
+    is_incognito: bool = False
+    user_id: Optional[str] = None
+
+
+class ConversationCreate(ConversationBase):
+    """Schema for creating a new conversation."""
+    id: Optional[str] = None
+
+
+class ConversationUpdate(BaseModel):
+    """Schema for updating conversation (all fields optional)."""
+    title: Optional[str] = None
+    is_incognito: Optional[bool] = None
+
+
+class ConversationResponse(ConversationBase):
+    """Schema for conversation API responses."""
+    id: str
+    created_at: datetime
+    updated_at: datetime
+    messages: List[MessageResponse] = []
+
+    class Config:
+        from_attributes = True
+
+
+class ConversationListResponse(BaseModel):
+    """Schema for list of conversations with pagination."""
+    items: List[ConversationResponse]
+    total: int
+    page: int
+    page_size: int
+    pages: int

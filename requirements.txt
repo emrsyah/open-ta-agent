@@ -33,3 +33,7 @@ voyageai
 
 # Redis (for conversation session management)
 redis[hiredis]
+
+# Authentication
+pyjwt
+python-jose[cryptography]
