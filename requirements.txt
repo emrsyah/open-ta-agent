@@ -1,36 +1,34 @@
-# DSPy + FastAPI Paper Research Platform
-# Core dependencies for streaming AI chat backend
+# Paper Research Platform - FastAPI + DSPy Backend
+# Telkom University Paper Research API
 
-# FastAPI & Web Framework
-fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
-pydantic>=2.5.0
-pydantic-settings>=2.1.0
+# Web Framework
+fastapi
+uvicorn
 
-# DSPy & AI
-dspy-ai>=2.5.0
-openai>=1.0.0
+# Data Validation
+pydantic
+pydantic-settings
 
-# Data Processing
-orjson>=3.9.0
-numpy>=1.24.0
+# AI Framework
+dspy-ai
 
-# Vector Search (if using local embeddings)
-sentence-transformers>=2.2.0
-faiss-cpu>=1.7.0  # or faiss-gpu for GPU
+# JSON Processing (faster than standard json)
+orjson
 
 # Environment Variables
-python-dotenv>=1.0.0
+python-dotenv
 
-# Optional: Redis for session history
-redis>=5.0.0
+# Database (PostgreSQL via Supabase)
+sqlalchemy[asyncio]
+asyncpg
+alembic
 
-# Optional: Database for paper metadata
-sqlalchemy>=2.0.0
-asyncpg>=0.29.0  # PostgreSQL
-# or
-# aiosqlite>=0.19.0  # SQLite
+# Database Connection Pooling
+psycopg2-binary
 
-# Development
-pytest>=7.4.0
-httpx>=0.25.0  # For testing async endpoints
+# Vector Search and Embeddings
+pgvector
+voyageai
+
+# Redis (for conversation session management)
+redis[hiredis]
