@@ -1,5 +1,5 @@
 # Multi-stage build for OpenTA Backend on Render.com
-# This Dockerfile is optimized for Render's deployment environment
+# Cache-busted version to force fresh dependency install
 
 # Stage 1: Builder - Compile dependencies
 FROM python:3.11-slim as builder
@@ -14,7 +14,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for better caching
+# CACHE BUST: Add timestamp to force rebuild
+# Last updated: 2025-02-23-22:50:00 to fix packaging module issue
+RUN echo "Cache bust: $(date +%s)" > /tmp/cachebust
+
+# Copy requirements file
 COPY requirements.txt .
 
 # Install Python dependencies to a temporary location
