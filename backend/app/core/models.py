@@ -164,12 +164,24 @@ class CitedPaper(BaseModel):
     citation_number: int = Field(..., description="Inline citation number used in answer, e.g. [1]")
 
 
+class CitationAudit(BaseModel):
+    """Result of checking inline [N] citations against retrieved papers."""
+    is_clean: bool = Field(..., description="True when all [N] citations are within range")
+    hallucinated_citation_numbers: List[int] = Field(
+        default_factory=list,
+        description="[N] numbers found in the answer that exceed available paper count"
+    )
+    total_citations_in_answer: int = Field(..., description="Total [N] references found in the answer text")
+    total_papers_available: int = Field(..., description="Number of papers retrieved for this query")
+
+
 class ChatResponse(BaseModel):
     """Non-streaming chat response."""
     answer: str = Field(..., description="Generated answer with inline citations like [1], [2]")
     sources: List[CitedPaper] = Field(default_factory=list, description="Cited papers in citation order")
     context: Optional[str] = Field(default=None, description="Retrieved context")
     search_query: Optional[str] = Field(default=None, description="Generated search query used for retrieval")
+    citation_audit: Optional[CitationAudit] = Field(default=None, description="Citation hallucination check result")
 
 
 class StreamChunk(BaseModel):

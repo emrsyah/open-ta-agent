@@ -7,10 +7,10 @@ import logging
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
 
-from app.core.models import ChatRequest, ChatResponse
+from app.core.models import ChatRequest, ChatResponse, CitationAudit
 from app.services.rag import get_rag_service
 from app.services.session_manager import get_session_manager
-from app.utils.streaming import stream_dspy_response
+from app.utils.streaming import _audit_citations, stream_dspy_response
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -114,11 +114,17 @@ async def chat_basic(request: ChatRequest, background_tasks: BackgroundTasks):
                     question=query,
                     answer=result["answer"],
                 )
+        # Citation audit on non-streaming path (pure Python, no LLM)
+        raw_sources = result.get("sources", [])
+        audit_data = _audit_citations(result["answer"], raw_sources)
+        citation_audit = CitationAudit(**audit_data)
+
         return ChatResponse(
             answer=result["answer"],
-            sources=result["sources"],
+            sources=raw_sources,
             context=result.get("rationale"),
             search_query=result.get("search_query"),
+            citation_audit=citation_audit,
         )
 
     # ------------------------------------------------------------------ #
@@ -157,6 +163,8 @@ async def chat_basic(request: ChatRequest, background_tasks: BackgroundTasks):
             planner=rag_service.planner,
             on_complete=_on_complete,
             generate_title=_title_generator if is_first_message and not meta_params.is_incognito else None,
+            query_reformulator=rag_service.query_reformulator,
+            gap_detector=rag_service.gap_detector,
         ),
         media_type="text/event-stream",
         headers={

@@ -25,6 +25,17 @@ class QueryGenerationSignature(dspy.Signature):
     search_query: str = dspy.OutputField(desc="Optimized search keywords (3-5 key terms) for database lookup")
 
 
+class QueryReformulationSignature(dspy.Signature):
+    """
+    The initial search returned no results. Broaden or rephrase the query
+    to increase the chance of finding relevant academic papers.
+    Return 2-4 broader keywords. Do NOT change the core topic.
+    """
+    original_query: str = dspy.InputField(desc="The search query that returned no results")
+    broader_query: str = dspy.OutputField(desc="A broader/rephrased search query (2-4 keywords)")
+
+
+
 class PaperChatSignature(dspy.Signature):
     """
     You are 'OpenTA Agent', a specialized research assistant for Telkom University.
@@ -114,6 +125,21 @@ class IntentClassificationSignature(dspy.Signature):
     explanation: str = dspy.OutputField(desc="Brief reasoning for the chosen category")
 
 
+class GapDetectionSignature(dspy.Signature):
+    """
+    Determine if a generated answer fully covers all aspects of the user's question.
+    If anything is missing, produce a search query targeting only the missing parts.
+    Be concise and strict. Only flag genuinely multi-faceted questions with a real gap.
+    For simple/general questions always return verdict='complete'.
+    """
+    question: str = dspy.InputField()
+    answer: str = dspy.InputField(desc="The generated answer to evaluate")
+    verdict: str = dspy.OutputField(desc="'complete' or 'partial'")
+    gap_query: str = dspy.OutputField(
+        desc="A search query for the missing aspects. Return empty string if verdict is 'complete'."
+    )
+
+
 class AcknowledgmentSignature(dspy.Signature):
     """
     Generate a brief, context-aware acknowledgment before starting research.
@@ -187,6 +213,29 @@ class QueryGenerator(dspy.Module):
         )
 
 
+class QueryReformulator(dspy.Module):
+    """Generates a broader query when the first search returns no results."""
+
+    def __init__(self):
+        super().__init__()
+        self.reformulate = dspy.Predict(QueryReformulationSignature)
+
+    def forward(self, original_query: str) -> dspy.Prediction:
+        result = self.reformulate(original_query=original_query)
+        return dspy.Prediction(broader_query=result.broader_query)
+
+
+class GapDetector(dspy.Module):
+    """Detects missing aspects in a generated answer and returns a gap-filling search query."""
+
+    def __init__(self):
+        super().__init__()
+        self.detect = dspy.Predict(GapDetectionSignature)
+
+    def forward(self, question: str, answer: str) -> dspy.Prediction:
+        return self.detect(question=question, answer=answer)
+
+
 class PaperRAG(dspy.Module):
     """
     RAG module for paper Q&A.
@@ -257,9 +306,11 @@ class RAGService:
         self.retriever = retriever or PaperRetriever()
         self.rag_module = PaperRAG(retriever=self.retriever)
         self.query_generator = QueryGenerator()
+        self.query_reformulator = QueryReformulator()
         self.intent_classifier = IntentClassifier()
         self.acknowledgment_generator = AcknowledgmentGenerator()
         self.planner = ResearchPlanner()
+        self.gap_detector = GapDetector()
         self.cheap_lm = cheap_lm
     
     def _generate_search_query(self, user_question: str) -> str:
@@ -403,6 +454,22 @@ class RAGService:
         # Step 2: Retrieve context + papers together (avoids extra DB calls later)
         logger.info(f"[RAG] Retrieving context with query: '{search_query}'")
         context, retrieved_papers = await self.retriever.get_papers_with_context(search_query)
+
+        # Zero-result retry (Improvement 1)
+        if len(retrieved_papers) == 0 and self.query_reformulator:
+            logger.info("[RAG] No papers found. Reforming query...")
+            if self.cheap_lm:
+                with dspy.context(lm=self.cheap_lm):
+                    reformulation = self.query_reformulator(original_query=search_query)
+            else:
+                reformulation = self.query_reformulator(original_query=search_query)
+            
+            broader_query = reformulation.broader_query.strip()
+            if broader_query and broader_query != search_query:
+                logger.info(f"[RAG] Retrying with broader query: '{broader_query}'")
+                search_query = broader_query
+                context, retrieved_papers = await self.retriever.get_papers_with_context(search_query)
+
         logger.info(f"[RAG] Context retrieved (length: {len(context)} chars, {len(retrieved_papers)} papers)")
 
         # Step 3: Generate answer with history context
@@ -418,11 +485,51 @@ class RAGService:
             retrieved_papers
         )
 
-        logger.info(f"[RAG] Answer generated ({len(result.answer)} chars, {len(cited_papers)} cited papers)")
+        final_answer = result.answer
+        final_sources = cited_papers
+
+        # Adaptive gap-filling (Improvement 3)
+        if self.gap_detector:
+            try:
+                logger.info("[RAG] Checking for gaps in answer...")
+                if self.cheap_lm:
+                    with dspy.context(lm=self.cheap_lm):
+                        gap_result = self.gap_detector(question=question, answer=final_answer)
+                else:
+                    gap_result = self.gap_detector(question=question, answer=final_answer)
+                
+                if getattr(gap_result, "verdict", "complete") == "partial" and getattr(gap_result, "gap_query", "").strip():
+                    gap_q = gap_result.gap_query.strip()
+                    logger.info(f"[RAG] Gap detected. Refining with query: '{gap_q}'")
+                    
+                    extra_context, extra_papers = await self.retriever.get_papers_with_context(gap_q)
+                    
+                    if extra_papers:
+                        # Combine context and deduplicate papers
+                        enriched_context = context + "\n\n" + extra_context
+                        seen_ids = {p.id for p in retrieved_papers}
+                        all_unique_papers = retrieved_papers + [p for p in extra_papers if p.id not in seen_ids]
+                        
+                        logger.info("[RAG] Generating refined answer...")
+                        refined_result = self.rag_module(
+                            question=question,
+                            context=enriched_context,
+                            history=dspy_history
+                        )
+                        
+                        final_answer = refined_result.answer
+                        final_sources = self._build_cited_papers(
+                            getattr(refined_result, 'sources', []),
+                            all_unique_papers
+                        )
+            except Exception as e:
+                logger.warning(f"[RAG] Gap detection/refinement failed: {e}")
+
+        logger.info(f"[RAG] Final answer generated ({len(final_answer)} chars, {len(final_sources)} cited papers)")
 
         return {
-            "answer": result.answer,
-            "sources": cited_papers,
+            "answer": final_answer,
+            "sources": final_sources,
             "rationale": getattr(result, 'rationale', None),
             "search_query": search_query
         }

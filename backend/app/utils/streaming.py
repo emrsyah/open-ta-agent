@@ -62,6 +62,25 @@ def _paper_summary(papers: list) -> str:
     return "\n".join(lines)
 
 
+def _audit_citations(answer: str, cited_papers: list) -> dict:
+    """
+    Pure-Python citation hallucination check.
+    Scans answer text for [N] references and flags any N that exceeds
+    the number of actually retrieved papers.
+    No LLM call — zero latency overhead.
+    """
+    import re
+    cited_nums = {int(n) for n in re.findall(r'\[(\d+)\]', answer)}
+    valid_nums = {p.citation_number for p in cited_papers}
+    hallucinated = sorted(cited_nums - valid_nums)
+    return {
+        "is_clean": len(hallucinated) == 0,
+        "hallucinated_citation_numbers": hallucinated,
+        "total_citations_in_answer": len(cited_nums),
+        "total_papers_available": len(cited_papers),
+    }
+
+
 # ---------------------------------------------------------------------------
 # DSPy async helpers
 # ---------------------------------------------------------------------------
@@ -100,11 +119,15 @@ async def _execute_search_step(
     query_generator: Any,
     cheap_lm: Any,
     pre_generated_query: str | None = None,
-) -> tuple[str, list, str]:
+    query_reformulator: Any = None,
+) -> tuple[str, list, str, str | None]:
     """
     Runs query generation + retrieval for a search step.
-    Returns (search_query, papers, context_string).
-    Uses pre_generated_query when available to skip the LLM call.
+    Returns (search_query, papers, context_string, original_query_if_reformulated).
+    - If pre_generated_query is provided it is used directly.
+    - If retrieval returns 0 papers and query_reformulator is provided,
+      reformulates the query and retries once.
+    - original_query_if_reformulated is non-None only when reformulation occurred.
     """
     if pre_generated_query:
         search_query = pre_generated_query
@@ -117,7 +140,19 @@ async def _execute_search_step(
         search_query = question
 
     context, papers = await retriever.get_papers_with_context(search_query)
-    return search_query, papers, context
+
+    # Zero-result retry: reformulate and try once more
+    if len(papers) == 0 and query_reformulator:
+        original_query = search_query
+        reformulation = await _run_dspy_sync(
+            query_reformulator, cheap_lm=cheap_lm, original_query=search_query
+        )
+        broader_query = reformulation.broader_query.strip()
+        if broader_query and broader_query != search_query:
+            context, papers = await retriever.get_papers_with_context(broader_query)
+            return broader_query, papers, context, original_query
+
+    return search_query, papers, context, None
 
 
 async def _stream_step_thinking(
@@ -175,6 +210,8 @@ async def stream_dspy_response(
     planner: ResearchPlanner | None = None,
     on_complete: Any = None,
     generate_title: Any = None,
+    query_reformulator: Any = None,
+    gap_detector: Any = None,
 ) -> AsyncGenerator[str, None]:
     """
     on_complete:     async callable(answer, sources, search_query) — save history.
@@ -386,12 +423,25 @@ async def stream_dspy_response(
                         }
                     )
 
-                search_query, papers, context = await _execute_search_step(
+                search_query, papers, context, original_query = await _execute_search_step(
                     step, question, retriever, query_generator, cheap_lm,
                     pre_generated_query=pre_generated_query,
+                    query_reformulator=query_reformulator,
                 )
                 # Only use pre_generated_query for the first search step
                 pre_generated_query = None
+
+                # Emit reformulation notice if it happened
+                if original_query is not None:
+                    yield format_sse(
+                        {
+                            "type": "step_action",
+                            "step_id": step.id,
+                            "action": "reformulated_query",
+                            "original_query": original_query,
+                            "query": search_query,
+                        }
+                    )
 
                 all_papers.extend(papers)
                 all_context_parts.append(context)
@@ -485,6 +535,64 @@ async def stream_dspy_response(
                         sources=final_sources,
                         search_query=pre_generated_query,
                     )
+
+                # Citation hallucination audit (pure Python, no LLM call)
+                audit = _audit_citations(final_answer, cited_papers)
+                yield format_sse({"type": "citation_audit", **audit})
+                if not audit["is_clean"]:
+                    logger.warning(
+                        "[STREAM] Hallucinated citations detected: %s",
+                        audit["hallucinated_citation_numbers"],
+                    )
+
+                # Adaptive gap-filling re-retrieval (only for research questions)
+                if gap_detector and is_research:
+                    try:
+                        gap_result = await _run_dspy_sync(
+                            gap_detector, cheap_lm=cheap_lm,
+                            question=question, answer=final_answer,
+                        )
+                        if (
+                            getattr(gap_result, "verdict", "complete") == "partial"
+                            and getattr(gap_result, "gap_query", "").strip()
+                        ):
+                            gap_q = gap_result.gap_query.strip()
+                            logger.info("[STREAM] Gap detected. Refining with query: '%s'", gap_q)
+                            yield format_sse({"type": "refinement_start", "gap_query": gap_q})
+
+                            extra_context, extra_papers = await retriever.get_papers_with_context(gap_q)
+                            yield format_sse({"type": "refinement_search", "paper_count": len(extra_papers)})
+
+                            # Merge unique new papers into existing set
+                            new_papers = [p for p in extra_papers if p.id not in seen_ids]
+                            for p in new_papers:
+                                seen_ids.add(p.id)
+                            all_refinement_papers = unique_papers + new_papers
+                            enriched_context = combined_context + ("\n\n" + extra_context if extra_context else "")
+
+                            # Re-generate with enriched context, streaming refinement tokens
+                            refinement_program = dspy.streamify(
+                                dspy_program,
+                                stream_listeners=[
+                                    dspy.streaming.StreamListener(signature_field_name="answer")
+                                ],
+                            )
+                            async for rval in refinement_program(
+                                question=question, context=enriched_context, history=history
+                            ):
+                                if isinstance(rval, dspy.streaming.StreamResponse) and rval.chunk:
+                                    yield format_sse({"type": "refinement_token", "content": rval.chunk})
+                                elif isinstance(rval, dspy.Prediction):
+                                    refined_cited = _build_cited_papers(
+                                        getattr(rval, "sources", []), all_refinement_papers
+                                    )
+                                    yield format_sse({
+                                        "type": "refinement_done",
+                                        "content": getattr(rval, "answer", ""),
+                                        "sources": [p.model_dump() for p in refined_cited],
+                                    })
+                    except Exception as _ge:
+                        logger.warning("[STREAM] Gap detection/refinement failed: %s", _ge)
 
                 # Generate and emit title (only when caller requests it)
                 if generate_title:
