@@ -179,6 +179,7 @@ async def chat_basic(
             on_complete=_on_complete,
             generate_title=_title_generator if is_first_message and not meta_params.is_incognito else None,
             query_reformulator=rag_service.query_reformulator,
+            query_decomposer=rag_service.query_decomposer,
             gap_detector=rag_service.gap_detector,
         ),
         media_type="text/event-stream",

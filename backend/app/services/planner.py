@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from typing import List
+from typing import List, Literal, Optional
 
 import dspy
 from pydantic import BaseModel
@@ -17,32 +17,64 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 
-class PlanStep(BaseModel):
+class SmartPlanStep(BaseModel):
+    """Enhanced plan step with query strategy support.
+    
+    Allows AI planner to specify single vs multi-query retrieval
+    without hardcoding heuristics.
+    """
     id: int
     title: str
     description: str
-    needs_search: bool
+    step_type: Literal["research", "synthesis", "comparison", "analysis"] = "research"
+    query_strategy: Literal["single", "multi_query"] = "single"
+    decomposition_hint: str | None = None
+    focus_area: str | None = None
+    
+    # Legacy compatibility
+    @property
+    def needs_search(self) -> bool:
+        return self.step_type in ("research", "comparison", "analysis")
+
+
+# Legacy alias for backwards compatibility
+PlanStep = SmartPlanStep
 
 
 class ResearchPlanSignature(dspy.Signature):
     """
-    Create a focused, minimal research plan to answer the user's question.
+    Create a focused research plan with 2-3 smart steps.
 
     Rules:
-    - General questions (greetings, identity, small talk): 1 step, needs_search=false.
-    - Simple single-topic research: 2 steps (one search step, one synthesis step).
-    - Complex or multi-faceted research questions: 3-4 steps, never exceed 4.
-    - Step titles must be short action phrases (3-6 words, e.g. "Search relevant papers").
-    - Set needs_search=true only on steps that require retrieving academic papers.
-    - Assign sequential integer ids starting from 0.
+    - General questions: 1 synthesis step, query_strategy='single'
+    - Simple research: 1 research step + 1 synthesis step
+    - Comparison queries: 2-3 steps with query_strategy='multi_query'
+    - Use decomposition_hint to specify what to decompose (e.g., 'methods:A,B,C')
+    - Keep steps minimal: 2-3 max, never exceed 4
+    - Assign sequential integer ids starting from 0
+    
+    Step Types:
+    - 'research': Investigate a topic (needs_search=True)
+    - 'synthesis': Combine findings without new search (needs_search=False)
+    - 'comparison': Compare multiple items (use multi_query strategy)
+    - 'analysis': Analyze specific aspect (needs_search=True)
+    
+    Query Strategies:
+    - 'single': One search query for this step
+    - 'multi_query': Decompose into 2-4 parallel sub-queries
+    
+    Decomposition Hint Format:
+    - 'methods:Random Forest,SVM,Neural Networks'
+    - 'papers:P123,P456,P789'
+    - 'aspects:accuracy,cost,privacy'
     """
 
     question: str = dspy.InputField(desc="The user's question")
     is_research: bool = dspy.InputField(
         desc="True if this question requires academic paper research"
     )
-    steps: List[PlanStep] = dspy.OutputField(
-        desc="Ordered list of 1-4 plan steps"
+    steps: List[SmartPlanStep] = dspy.OutputField(
+        desc="Ordered list of 2-3 smart plan steps with query strategies"
     )
 
 
@@ -92,28 +124,31 @@ class ResearchPlanner(dspy.Module):
         return steps
 
 
-def default_plan(is_research: bool) -> List[PlanStep]:
+def default_plan(is_research: bool) -> List[SmartPlanStep]:
     """Fallback plan when the planner module is unavailable."""
     if not is_research:
         return [
-            PlanStep(
+            SmartPlanStep(
                 id=0,
                 title="Preparing response",
                 description="Formulate a helpful response to the general question",
-                needs_search=False,
+                step_type="synthesis",
+                query_strategy="single"
             )
         ]
     return [
-        PlanStep(
+        SmartPlanStep(
             id=0,
             title="Searching relevant papers",
             description="Find academic papers relevant to the question",
-            needs_search=True,
+            step_type="research",
+            query_strategy="single"
         ),
-        PlanStep(
+        SmartPlanStep(
             id=1,
             title="Synthesizing findings",
             description="Compile the retrieved information into a clear answer",
-            needs_search=False,
+            step_type="synthesis",
+            query_strategy="single"
         ),
     ]

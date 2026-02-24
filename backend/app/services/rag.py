@@ -9,6 +9,7 @@ import dspy
 from typing import List, Optional
 from app.services.retriever import PaperRetriever
 from app.services.planner import ResearchPlanner
+from app.services.query_decomposer import QueryDecomposer
 from app.core.models import CitedPaper
 
 logger = logging.getLogger(__name__)
@@ -307,6 +308,7 @@ class RAGService:
         self.rag_module = PaperRAG(retriever=self.retriever)
         self.query_generator = QueryGenerator()
         self.query_reformulator = QueryReformulator()
+        self.query_decomposer = QueryDecomposer()
         self.intent_classifier = IntentClassifier()
         self.acknowledgment_generator = AcknowledgmentGenerator()
         self.planner = ResearchPlanner()

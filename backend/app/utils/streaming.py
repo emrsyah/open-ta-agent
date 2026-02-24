@@ -16,6 +16,8 @@ import dspy
 
 from app.core.models import CitedPaper
 from app.services.planner import PlanStep, ResearchPlanner, default_plan
+from app.services.query_decomposer import QueryDecomposer
+from app.utils.parallel_retrieve import parallel_retrieve
 
 logger = logging.getLogger(__name__)
 
@@ -120,15 +122,56 @@ async def _execute_search_step(
     cheap_lm: Any,
     pre_generated_query: str | None = None,
     query_reformulator: Any = None,
+    query_decomposer: QueryDecomposer | None = None,
 ) -> tuple[str, list, str, str | None]:
     """
     Runs query generation + retrieval for a search step.
     Returns (search_query, papers, context_string, original_query_if_reformulated).
-    - If pre_generated_query is provided it is used directly.
+    
+    Supports two strategies:
+    - 'single': One query, one retrieval (original behavior)
+    - 'multi_query': Decompose into 2-4 parallel retrievals (NEW)
+    
+    - If pre_generated_query is provided it is used directly for single strategy.
     - If retrieval returns 0 papers and query_reformulator is provided,
       reformulates the query and retries once.
     - original_query_if_reformulated is non-None only when reformulation occurred.
     """
+    # Check if this step uses multi-query strategy
+    use_multi_query = getattr(step, 'query_strategy', 'single') == 'multi_query'
+    decomposition_hint = getattr(step, 'decomposition_hint', None)
+    
+    if use_multi_query and query_decomposer:
+        # Multi-query path: decompose and parallel retrieve
+        logger.info(f"[STEP {step.id}] Using multi-query strategy")
+        
+        # Decompose query into sub-queries
+        decompose_result = await _run_dspy_sync(
+            query_decomposer, cheap_lm=cheap_lm,
+            question=question,
+            decomposition_hint=decomposition_hint
+        )
+        
+        sub_queries = getattr(decompose_result, 'sub_queries', [])
+        if not sub_queries or len(sub_queries) < 2:
+            logger.warning(f"[STEP {step.id}] Decomposer returned < 2 queries, falling back to single")
+            use_multi_query = False
+        else:
+            logger.info(f"[STEP {step.id}] Decomposed into {len(sub_queries)} sub-queries")
+            
+            # Parallel retrieval
+            context, papers = await parallel_retrieve(
+                retriever=retriever,
+                queries=sub_queries,
+                top_k=3,
+                use_vector=True
+            )
+            
+            # Return with combined query string for display
+            combined_query = " | ".join(sub_queries)
+            return combined_query, papers, context, None
+    
+    # Single-query path (original behavior)
     if pre_generated_query:
         search_query = pre_generated_query
     elif query_generator:
@@ -211,6 +254,7 @@ async def stream_dspy_response(
     on_complete: Any = None,
     generate_title: Any = None,
     query_reformulator: Any = None,
+    query_decomposer: QueryDecomposer | None = None,
     gap_detector: Any = None,
 ) -> AsyncGenerator[str, None]:
     """
@@ -427,6 +471,7 @@ async def stream_dspy_response(
                     step, question, retriever, query_generator, cheap_lm,
                     pre_generated_query=pre_generated_query,
                     query_reformulator=query_reformulator,
+                    query_decomposer=query_decomposer,
                 )
                 # Only use pre_generated_query for the first search step
                 pre_generated_query = None
