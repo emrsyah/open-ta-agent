@@ -96,6 +96,37 @@ async def _run_dspy_sync(fn, cheap_lm=None, **kwargs):
     return await asyncio.to_thread(_call)
 
 
+async def _keepalive_wrap(
+    source: AsyncGenerator,
+    interval: float = 15.0,
+) -> AsyncGenerator[str, None]:
+    """
+    Wraps an async generator and injects SSE keepalive comment lines
+    (': keepalive\\n\\n') at most every `interval` seconds whenever the
+    source is silent.  This prevents Render / nginx / any reverse-proxy with
+    a 30-60 s idle-connection timeout from killing long LLM answer streams.
+    """
+    sentinel = object()
+
+    async def _next(ait):
+        try:
+            return await ait.__anext__()
+        except StopAsyncIteration:
+            return sentinel
+
+    ait = source.__aiter__()
+    while True:
+        try:
+            value = await asyncio.wait_for(_next(ait), timeout=interval)
+        except asyncio.TimeoutError:
+            # No token arrived within `interval` seconds — send a keepalive ping
+            yield ": keepalive\n\n"
+            continue
+        if value is sentinel:
+            break
+        yield value
+
+
 def _should_use_default_plan(question: str) -> bool:
     """
     Heuristic: use default_plan (skip the planner LLM call) for simple questions.
@@ -554,98 +585,120 @@ async def stream_dspy_response(
         t_answer_start = time.perf_counter()
         logger.info("[STREAM] Generating final answer...")
 
-        async for value in streaming_program(
-            question=question, context=combined_context, history=history
-        ):
-            if isinstance(value, dspy.streaming.StreamResponse) and value.chunk:
-                token_count += 1
-                yield format_sse({"type": "token", "content": value.chunk})
+        final_answer: str = ""
+        final_sources: list = []
+        cited_papers: list = []
 
-            elif isinstance(value, dspy.Prediction):
-                cited_papers = _build_cited_papers(
-                    getattr(value, "sources", []), unique_papers
-                )
-                final_answer = getattr(value, "answer", str(value))
-                final_sources = [p.model_dump() for p in cited_papers]
-                yield format_sse(
-                    {
-                        "type": "done",
-                        "content": final_answer,
-                        "sources": final_sources,
-                    }
-                )
-                if on_complete:
-                    await on_complete(
-                        answer=final_answer,
-                        sources=final_sources,
-                        search_query=pre_generated_query,
+        async def _generate_tokens():
+            """Inner generator that yields already-formatted SSE strings."""
+            nonlocal final_answer, final_sources, cited_papers, token_count
+            raw = streaming_program(
+                question=question, context=combined_context, history=history
+            )
+            async for val in raw:
+                if isinstance(val, dspy.streaming.StreamResponse) and val.chunk:
+                    token_count += 1
+                    yield format_sse({"type": "token", "content": val.chunk})
+                elif isinstance(val, dspy.Prediction):
+                    cited_papers = _build_cited_papers(
+                        getattr(val, "sources", []), unique_papers
+                    )
+                    final_answer = getattr(val, "answer", str(val))
+                    final_sources = [p.model_dump() for p in cited_papers]
+                    yield format_sse(
+                        {
+                            "type": "done",
+                            "content": final_answer,
+                            "sources": final_sources,
+                        }
                     )
 
-                # Citation hallucination audit (pure Python, no LLM call)
-                audit = _audit_citations(final_answer, cited_papers)
-                yield format_sse({"type": "citation_audit", **audit})
-                if not audit["is_clean"]:
-                    logger.warning(
-                        "[STREAM] Hallucinated citations detected: %s",
-                        audit["hallucinated_citation_numbers"],
+        async for sse_chunk in _keepalive_wrap(_generate_tokens(), interval=15.0):
+            yield sse_chunk
+
+        # ------------------------------------------------------------------ #
+        # Post-stream: citation audit + history + title (all after done)     #
+        # ------------------------------------------------------------------ #
+        if on_complete:
+            await on_complete(
+                answer=final_answer,
+                sources=final_sources,
+                search_query=pre_generated_query,
+            )
+
+        # Citation hallucination audit (pure Python, no LLM call)
+        if cited_papers or final_answer:
+            audit = _audit_citations(final_answer, cited_papers)
+            yield format_sse({"type": "citation_audit", **audit})
+            if not audit["is_clean"]:
+                logger.warning(
+                    "[STREAM] Hallucinated citations detected: %s",
+                    audit["hallucinated_citation_numbers"],
+                )
+
+        # Adaptive gap-filling re-retrieval (only for research questions)
+        # Runs AFTER the core stream is done so it never blocks the main answer.
+        if gap_detector and is_research and final_answer:
+            try:
+                gap_result = await _run_dspy_sync(
+                    gap_detector, cheap_lm=cheap_lm,
+                    question=question, answer=final_answer,
+                )
+                if (
+                    getattr(gap_result, "verdict", "complete") == "partial"
+                    and getattr(gap_result, "gap_query", "").strip()
+                ):
+                    gap_q = gap_result.gap_query.strip()
+                    logger.info("[STREAM] Gap detected. Refining with query: '%s'", gap_q)
+                    yield format_sse({"type": "refinement_start", "gap_query": gap_q})
+
+                    extra_context, extra_papers = await retriever.get_papers_with_context(gap_q)
+                    yield format_sse({"type": "refinement_search", "paper_count": len(extra_papers)})
+
+                    # Merge unique new papers into existing set
+                    new_papers = [p for p in extra_papers if p.id not in seen_ids]
+                    for p in new_papers:
+                        seen_ids.add(p.id)
+                    all_refinement_papers = unique_papers + new_papers
+                    enriched_context = combined_context + ("\n\n" + extra_context if extra_context else "")
+
+                    # Re-generate with enriched context, streaming refinement tokens
+                    refinement_program = dspy.streamify(
+                        dspy_program,
+                        stream_listeners=[
+                            dspy.streaming.StreamListener(signature_field_name="answer")
+                        ],
                     )
 
-                # Adaptive gap-filling re-retrieval (only for research questions)
-                if gap_detector and is_research:
-                    try:
-                        gap_result = await _run_dspy_sync(
-                            gap_detector, cheap_lm=cheap_lm,
-                            question=question, answer=final_answer,
-                        )
-                        if (
-                            getattr(gap_result, "verdict", "complete") == "partial"
-                            and getattr(gap_result, "gap_query", "").strip()
+                    async def _refinement_tokens():
+                        async for rval in refinement_program(
+                            question=question, context=enriched_context, history=history
                         ):
-                            gap_q = gap_result.gap_query.strip()
-                            logger.info("[STREAM] Gap detected. Refining with query: '%s'", gap_q)
-                            yield format_sse({"type": "refinement_start", "gap_query": gap_q})
+                            if isinstance(rval, dspy.streaming.StreamResponse) and rval.chunk:
+                                yield format_sse({"type": "refinement_token", "content": rval.chunk})
+                            elif isinstance(rval, dspy.Prediction):
+                                refined_cited = _build_cited_papers(
+                                    getattr(rval, "sources", []), all_refinement_papers
+                                )
+                                yield format_sse({
+                                    "type": "refinement_done",
+                                    "content": getattr(rval, "answer", ""),
+                                    "sources": [p.model_dump() for p in refined_cited],
+                                })
 
-                            extra_context, extra_papers = await retriever.get_papers_with_context(gap_q)
-                            yield format_sse({"type": "refinement_search", "paper_count": len(extra_papers)})
+                    async for r_chunk in _keepalive_wrap(_refinement_tokens(), interval=15.0):
+                        yield r_chunk
 
-                            # Merge unique new papers into existing set
-                            new_papers = [p for p in extra_papers if p.id not in seen_ids]
-                            for p in new_papers:
-                                seen_ids.add(p.id)
-                            all_refinement_papers = unique_papers + new_papers
-                            enriched_context = combined_context + ("\n\n" + extra_context if extra_context else "")
+            except Exception as _ge:
+                logger.warning("[STREAM] Gap detection/refinement failed: %s", _ge)
 
-                            # Re-generate with enriched context, streaming refinement tokens
-                            refinement_program = dspy.streamify(
-                                dspy_program,
-                                stream_listeners=[
-                                    dspy.streaming.StreamListener(signature_field_name="answer")
-                                ],
-                            )
-                            async for rval in refinement_program(
-                                question=question, context=enriched_context, history=history
-                            ):
-                                if isinstance(rval, dspy.streaming.StreamResponse) and rval.chunk:
-                                    yield format_sse({"type": "refinement_token", "content": rval.chunk})
-                                elif isinstance(rval, dspy.Prediction):
-                                    refined_cited = _build_cited_papers(
-                                        getattr(rval, "sources", []), all_refinement_papers
-                                    )
-                                    yield format_sse({
-                                        "type": "refinement_done",
-                                        "content": getattr(rval, "answer", ""),
-                                        "sources": [p.model_dump() for p in refined_cited],
-                                    })
-                    except Exception as _ge:
-                        logger.warning("[STREAM] Gap detection/refinement failed: %s", _ge)
-
-                # Generate and emit title (only when caller requests it)
-                if generate_title:
-                    try:
-                        title = await generate_title(question=question, answer=final_answer)
-                        yield format_sse({"type": "title", "content": title})
-                    except Exception as _te:
-                        logger.warning("[STREAM] Title generation error: %s", _te)
+        # Generate and emit title (only when caller requests it)
+        if generate_title:
+            try:
+                title = await generate_title(question=question, answer=final_answer)
+                yield format_sse({"type": "title", "content": title})
+            except Exception as _te:
+                logger.warning("[STREAM] Title generation error: %s", _te)
 
         duration_ms = int((time.time() - start_time) * 1000)
         logger.info(
