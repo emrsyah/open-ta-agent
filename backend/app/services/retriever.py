@@ -150,10 +150,19 @@ class PaperRetriever:
                 matches.append(paper)
         return matches[:limit]
     
-    async def get_papers_with_context(self, query: str, top_k: int = 3) -> tuple[str, List[PaperResult]]:
+    async def get_papers_with_context(
+        self,
+        query: str,
+        top_k: int = 5,
+        paper_offset: int = 0,
+    ) -> tuple[str, List[PaperResult]]:
         """
         Retrieve papers and return both the formatted context string and the paper objects.
         Use this instead of get_context() so callers can enrich sources without extra DB calls.
+
+        Args:
+            paper_offset: Starting number for Paper N labels (for multi-step global numbering).
+                          e.g. pass len(already_retrieved_papers) so step 2 starts at Paper 4.
         """
         logger.info(f"[RETRIEVER] Context retrieval for: '{query}'")
         papers = await self.search(query, limit=top_k)
@@ -162,7 +171,7 @@ class PaperRetriever:
             return "No relevant papers found in the catalog.", []
 
         context_parts = []
-        for i, paper in enumerate(papers, 1):
+        for i, paper in enumerate(papers, start=paper_offset + 1):
             context_parts.append(
                 f"Paper {i} (ID: {paper.id})\n"
                 f"Title: {paper.title}\n"

@@ -3,6 +3,7 @@ Chat API routes for AI-powered paper Q&A.
 """
 
 import logging
+import mlflow
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -103,47 +104,60 @@ async def chat_basic(
     dspy_history = rag_service._convert_to_dspy_history(raw_history)
 
     if not stream:
-        result = await rag_service.chat(
-            query,
-            history=raw_history,
-            language=meta_params.language,
-            source_preference=meta_params.source_preference,
-        )
-        if conversation_id:
-            background_tasks.add_task(
-                _save_history,
-                conversation_id=conversation_id,
-                question=query,
-                answer=result["answer"],
-                sources=[s.model_dump() if hasattr(s, "model_dump") else s for s in result.get("sources", [])],
-                search_query=result.get("search_query"),
-                is_incognito=meta_params.is_incognito,
-                user_id=user_id,
+        # For non-streaming, we can wrap the whole operation in an MLflow run
+        with mlflow.start_run(run_name=f"ChatAPI-{conversation_id or 'anon'}"):
+            mlflow.log_params({
+                "conversation_id": conversation_id or "anonymous",
+                "is_incognito": meta_params.is_incognito,
+                "user_id": user_id or "anonymous",
+                "question": query[:100]
+            })
+            
+            result = await rag_service.chat(
+                query,
+                history=raw_history,
+                language=meta_params.language,
+                source_preference=meta_params.source_preference,
             )
-            if is_first_message and not meta_params.is_incognito:
+            
+            if conversation_id:
                 background_tasks.add_task(
-                    _generate_and_save_title_bg,
+                    _save_history,
                     conversation_id=conversation_id,
                     question=query,
                     answer=result["answer"],
+                    sources=[s.model_dump() if hasattr(s, "model_dump") else s for s in result.get("sources", [])],
+                    search_query=result.get("search_query"),
+                    is_incognito=meta_params.is_incognito,
                     user_id=user_id,
                 )
-        # Citation audit on non-streaming path (pure Python, no LLM)
-        raw_sources = result.get("sources", [])
-        audit_data = _audit_citations(result["answer"], raw_sources)
-        citation_audit = CitationAudit(**audit_data)
+                if is_first_message and not meta_params.is_incognito:
+                    background_tasks.add_task(
+                        _generate_and_save_title_bg,
+                        conversation_id=conversation_id,
+                        question=query,
+                        answer=result["answer"],
+                        user_id=user_id,
+                    )
+            # Citation audit on non-streaming path (pure Python, no LLM)
+            raw_sources = result.get("sources", [])
+            audit_data = _audit_citations(result["answer"], raw_sources)
+            citation_audit = CitationAudit(**audit_data)
 
-        return ChatResponse(
-            answer=result["answer"],
-            sources=raw_sources,
-            context=result.get("rationale"),
-            search_query=result.get("search_query"),
-            citation_audit=citation_audit,
-        )
+            return ChatResponse(
+                answer=result["answer"],
+                sources=raw_sources,
+                context=result.get("rationale"),
+                search_query=result.get("search_query"),
+                citation_audit=citation_audit,
+            )
 
     # ------------------------------------------------------------------ #
     # Streaming path                                                       #
     # ------------------------------------------------------------------ #
+    # Note: MLflow start_run doesn't play well with async generators in every environment,
+    # but autologging within the generator will still capture DSPy traces.
+    
     async def _on_complete(answer: str, sources: list, search_query: str | None) -> None:
         if conversation_id:
             await _save_history(
@@ -200,6 +214,130 @@ async def _generate_and_save_title_bg(
         await _save_title(conversation_id, title, user_id)
     except Exception as e:
         logger.warning("[CHAT] Background title generation failed for %s: %s", conversation_id, e)
+
+
+# ------------------------------------------------------------------ #
+# /chat/new — LangGraph-powered RAG pipeline                          #
+# ------------------------------------------------------------------ #
+
+@router.post("/new", response_model=ChatResponse)
+async def chat_new(
+    request: ChatRequest,
+    background_tasks: BackgroundTasks,
+    current_user: str = Depends(get_current_user_required),
+):
+    """LangGraph-powered AI chat with papers.
+    
+    Same functionality as /chat/basic but orchestrated via LangGraph
+    with DSPy modules as the prompt layer. Supports streaming (SSE)
+    and non-streaming responses.
+    """
+    from app.services.rag_langgraph import get_rag_service_lg
+
+    rag_service_lg = get_rag_service_lg()
+    query = request.get_query()
+    stream = request.get_stream()
+    conversation_id = request.get_conversation_id()
+    user_id = current_user
+    meta_params = request.meta_params
+
+    # Load history (same logic as /chat/basic)
+    raw_history = await _load_history(conversation_id, meta_params.is_incognito, user_id)
+    is_first_message = not raw_history
+    if raw_history and len(raw_history) > 5:
+        raw_history = raw_history[-5:]
+
+    if not stream:
+        result = await rag_service_lg.chat(
+            query,
+            history=raw_history,
+            language=meta_params.language,
+            source_preference=meta_params.source_preference,
+        )
+
+        if conversation_id:
+            background_tasks.add_task(
+                _save_history,
+                conversation_id=conversation_id,
+                question=query,
+                answer=result["answer"],
+                sources=[s.model_dump() if hasattr(s, "model_dump") else s for s in result.get("sources", [])],
+                search_query=result.get("search_query"),
+                is_incognito=meta_params.is_incognito,
+                user_id=user_id,
+            )
+            if is_first_message and not meta_params.is_incognito:
+                background_tasks.add_task(
+                    _generate_and_save_title_lg_bg,
+                    conversation_id=conversation_id,
+                    question=query,
+                    answer=result["answer"],
+                    user_id=user_id,
+                )
+
+        raw_sources = result.get("sources", [])
+        audit_data = _audit_citations(result["answer"], raw_sources)
+        citation_audit = CitationAudit(**audit_data)
+
+        return ChatResponse(
+            answer=result["answer"],
+            sources=raw_sources,
+            context=result.get("rationale"),
+            search_query=result.get("search_query"),
+            citation_audit=citation_audit,
+        )
+
+    # ── Streaming path (LangGraph) ───────────────────────────────────
+    async def _on_complete_lg(answer: str, sources: list, search_query: str | None) -> None:
+        if conversation_id:
+            await _save_history(
+                conversation_id=conversation_id,
+                question=query,
+                answer=answer,
+                sources=sources,
+                search_query=search_query,
+                is_incognito=meta_params.is_incognito,
+                user_id=user_id,
+            )
+
+    async def _title_generator_lg(question: str, answer: str) -> str:
+        title = await rag_service_lg.generate_title(question, answer)
+        if conversation_id and not meta_params.is_incognito:
+            await _save_title(conversation_id, title, user_id)
+        return title
+
+    return StreamingResponse(
+        rag_service_lg.stream_response(
+            question=query,
+            history=raw_history,
+            language=meta_params.language,
+            source_preference=meta_params.source_preference,
+            conversation_id=conversation_id,
+            is_incognito=meta_params.is_incognito,
+            user_id=user_id,
+            on_complete=_on_complete_lg,
+            generate_title_fn=_title_generator_lg if is_first_message and not meta_params.is_incognito else None,
+            is_first_message=is_first_message,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _generate_and_save_title_lg_bg(
+    conversation_id: str, question: str, answer: str, user_id: str | None = None
+) -> None:
+    """Background task: generate title via LangGraph service and save it."""
+    try:
+        from app.services.rag_langgraph import get_rag_service_lg
+        title = await get_rag_service_lg().generate_title(question, answer)
+        await _save_title(conversation_id, title, user_id)
+    except Exception as e:
+        logger.warning("[CHAT-LG] Background title generation failed for %s: %s", conversation_id, e)
 
 
 @router.post("/deep")

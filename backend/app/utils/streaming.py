@@ -105,26 +105,47 @@ async def _keepalive_wrap(
     (': keepalive\\n\\n') at most every `interval` seconds whenever the
     source is silent.  This prevents Render / nginx / any reverse-proxy with
     a 30-60 s idle-connection timeout from killing long LLM answer streams.
-    """
-    sentinel = object()
 
-    async def _next(ait):
+    IMPORTANT: Uses asyncio.wait() instead of asyncio.wait_for() because
+    wait_for CANCELS the inner coroutine on timeout, which throws
+    CancelledError into the async generator and destroys it.
+    asyncio.wait() returns pending futures WITHOUT cancelling them.
+    """
+    _sentinel = object()
+
+    async def _anext_or_stop(ait):
         try:
             return await ait.__anext__()
         except StopAsyncIteration:
-            return sentinel
+            return _sentinel
 
     ait = source.__aiter__()
-    while True:
-        try:
-            value = await asyncio.wait_for(_next(ait), timeout=interval)
-        except asyncio.TimeoutError:
-            # No token arrived within `interval` seconds — send a keepalive ping
-            yield ": keepalive\n\n"
-            continue
-        if value is sentinel:
-            break
-        yield value
+    pending = None
+
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(_anext_or_stop(ait))
+
+            done, _ = await asyncio.wait({pending}, timeout=interval)
+
+            if done:
+                # Future completed — retrieve value (may raise if generator errored)
+                value = pending.result()
+                pending = None
+                if value is _sentinel:
+                    break
+                yield value
+            else:
+                # No token arrived within `interval` seconds — send a keepalive ping.
+                # The pending future is NOT cancelled, so the generator stays alive.
+                yield ": keepalive\n\n"
+    finally:
+        # Clean up: cancel any in-flight future if consumer stops early
+        if pending is not None and not pending.done():
+            pending.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pending
 
 
 def _should_use_default_plan(question: str) -> bool:
@@ -154,54 +175,58 @@ async def _execute_search_step(
     pre_generated_query: str | None = None,
     query_reformulator: Any = None,
     query_decomposer: QueryDecomposer | None = None,
+    paper_offset: int = 0,
 ) -> tuple[str, list, str, str | None]:
     """
     Runs query generation + retrieval for a search step.
     Returns (search_query, papers, context_string, original_query_if_reformulated).
-    
+
     Supports two strategies:
     - 'single': One query, one retrieval (original behavior)
     - 'multi_query': Decompose into 2-4 parallel retrievals (NEW)
-    
+
     - If pre_generated_query is provided it is used directly for single strategy.
     - If retrieval returns 0 papers and query_reformulator is provided,
       reformulates the query and retries once.
     - original_query_if_reformulated is non-None only when reformulation occurred.
+    - paper_offset: number of papers already retrieved in previous steps, used to
+      produce globally unique Paper N labels in the context string.
     """
     # Check if this step uses multi-query strategy
     use_multi_query = getattr(step, 'query_strategy', 'single') == 'multi_query'
     decomposition_hint = getattr(step, 'decomposition_hint', None)
-    
+
     if use_multi_query and query_decomposer:
         # Multi-query path: decompose and parallel retrieve
         logger.info(f"[STEP {step.id}] Using multi-query strategy")
-        
+
         # Decompose query into sub-queries
         decompose_result = await _run_dspy_sync(
             query_decomposer, cheap_lm=cheap_lm,
             question=question,
             decomposition_hint=decomposition_hint
         )
-        
+
         sub_queries = getattr(decompose_result, 'sub_queries', [])
         if not sub_queries or len(sub_queries) < 2:
             logger.warning(f"[STEP {step.id}] Decomposer returned < 2 queries, falling back to single")
             use_multi_query = False
         else:
             logger.info(f"[STEP {step.id}] Decomposed into {len(sub_queries)} sub-queries")
-            
-            # Parallel retrieval
+
+            # Parallel retrieval (top_k=5 per sub-query, deduplication happens inside)
             context, papers = await parallel_retrieve(
                 retriever=retriever,
                 queries=sub_queries,
-                top_k=3,
-                use_vector=True
+                top_k=5,
+                use_vector=True,
+                paper_offset=paper_offset,
             )
-            
+
             # Return with combined query string for display
             combined_query = " | ".join(sub_queries)
             return combined_query, papers, context, None
-    
+
     # Single-query path (original behavior)
     if pre_generated_query:
         search_query = pre_generated_query
@@ -213,7 +238,7 @@ async def _execute_search_step(
     else:
         search_query = question
 
-    context, papers = await retriever.get_papers_with_context(search_query)
+    context, papers = await retriever.get_papers_with_context(search_query, paper_offset=paper_offset)
 
     # Zero-result retry: reformulate and try once more
     if len(papers) == 0 and query_reformulator:
@@ -223,7 +248,9 @@ async def _execute_search_step(
         )
         broader_query = reformulation.broader_query.strip()
         if broader_query and broader_query != search_query:
-            context, papers = await retriever.get_papers_with_context(broader_query)
+            context, papers = await retriever.get_papers_with_context(
+                broader_query, paper_offset=paper_offset
+            )
             return broader_query, papers, context, original_query
 
     return search_query, papers, context, None
@@ -350,12 +377,16 @@ async def stream_dspy_response(
         pre_generated_query: str | None = None
 
         if intent_task:
-            intent_res = await intent_task
-            is_research = intent_res.category != "general"
-            logger.info(
-                "[STREAM] Intent: %s (%.2fs)",
-                intent_res.category, time.perf_counter() - t_intent_start
-            )
+            try:
+                intent_res = await intent_task
+                is_research = intent_res.category != "general"
+                logger.info(
+                    "[STREAM] Intent: %s (%.2fs)",
+                    intent_res.category, time.perf_counter() - t_intent_start
+                )
+            except Exception as _ie:
+                logger.warning("[STREAM] Intent classification failed (%s) — defaulting to research", _ie)
+                is_research = True
 
         yield format_sse(
             {
@@ -397,23 +428,35 @@ async def stream_dspy_response(
         if not is_research:
             if query_task:
                 query_task.cancel()
+            yield format_sse({"type": "thinking_start"})
             yield format_sse({"type": "answer_start"})
 
             streaming_program = dspy.streamify(
                 dspy_program,
                 stream_listeners=[
-                    dspy.streaming.StreamListener(signature_field_name="answer")
+                    dspy.streaming.StreamListener(signature_field_name="reasoning"),
+                    dspy.streaming.StreamListener(signature_field_name="answer"),
                 ],
             )
+            _emitted_thinking_end = False
             async for value in streaming_program(
                 question=question,
                 context="No paper context needed for this general query.",
                 history=history,
             ):
                 if isinstance(value, dspy.streaming.StreamResponse) and value.chunk:
-                    token_count += 1
-                    yield format_sse({"type": "token", "content": value.chunk})
+                    field = getattr(value, "signature_field_name", "answer")
+                    if field == "reasoning":
+                        yield format_sse({"type": "thinking_token", "content": value.chunk})
+                    else:
+                        if not _emitted_thinking_end:
+                            yield format_sse({"type": "thinking_end"})
+                            _emitted_thinking_end = True
+                        token_count += 1
+                        yield format_sse({"type": "token", "content": value.chunk})
                 elif isinstance(value, dspy.Prediction):
+                    if not _emitted_thinking_end:
+                        yield format_sse({"type": "thinking_end"})
                     general_answer = getattr(value, "answer", str(value))
                     yield format_sse({"type": "done", "content": general_answer, "sources": []})
                     if on_complete:
@@ -441,6 +484,9 @@ async def stream_dspy_response(
                 logger.info("[STREAM] Pre-generated query: '%s'", pre_generated_query)
             except asyncio.CancelledError:
                 pre_generated_query = None
+            except Exception as _qe:
+                logger.warning("[STREAM] Pre-query generation failed (%s) — will generate during search step", _qe)
+                pre_generated_query = None
 
         yield format_sse(
             {"type": "status", "step": "planning", "message": "Planning approach..."}
@@ -449,10 +495,14 @@ async def stream_dspy_response(
         t_plan_start = time.perf_counter()
         use_default = _should_use_default_plan(question)
         if planner and not use_default:
-            steps = await asyncio.to_thread(
-                lambda: planner.create_plan(question=question, is_research=is_research, cheap_lm=cheap_lm)
-            )
-            logger.info("[STREAM] Planner LLM call took %.2fs", time.perf_counter() - t_plan_start)
+            try:
+                steps = await asyncio.to_thread(
+                    lambda: planner.create_plan(question=question, is_research=is_research, cheap_lm=cheap_lm)
+                )
+                logger.info("[STREAM] Planner LLM call took %.2fs", time.perf_counter() - t_plan_start)
+            except Exception as _pe:
+                logger.warning("[STREAM] Planner raised unexpectedly (%s) — using default plan", _pe)
+                steps = default_plan(is_research)
         else:
             steps = default_plan(is_research)
             logger.info("[STREAM] Using default_plan (heuristic skipped planner LLM call)")
@@ -503,6 +553,7 @@ async def stream_dspy_response(
                     pre_generated_query=pre_generated_query,
                     query_reformulator=query_reformulator,
                     query_decomposer=query_decomposer,
+                    paper_offset=len(all_papers),  # global numbering across steps
                 )
                 # Only use pre_generated_query for the first search step
                 pre_generated_query = None
@@ -559,7 +610,15 @@ async def stream_dspy_response(
         # ------------------------------------------------------------------ #
         # 5. Stream final answer                                               #
         # ------------------------------------------------------------------ #
+        # Emit thinking_start first — CoT will generate a reasoning trace before
+        # the answer tokens begin.  The frontend can render this as a collapsible
+        # "thinking" block (similar to Gemini / o3 reasoning UI).
+        # Emit answer_start BEFORE thinking_start so the frontend state
+        # transitions correctly:  answerStarted=true → isThinking=true.
+        # (Previously reversed, causing isThinking to flash true→false
+        # before reasoning tokens arrived.)
         yield format_sse({"type": "answer_start"})
+        yield format_sse({"type": "thinking_start"})
 
         # Deduplicate papers across search steps
         seen_ids: set = set()
@@ -575,31 +634,48 @@ async def stream_dspy_response(
             else "No paper context available for this general question."
         )
 
+        # Stream BOTH the CoT reasoning trace and the final answer tokens.
+        # DSPy's ChainOfThought always generates 'reasoning' before 'answer',
+        # so tokens arrive in order: reasoning × N → answer × N → Prediction.
         streaming_program = dspy.streamify(
             dspy_program,
             stream_listeners=[
-                dspy.streaming.StreamListener(signature_field_name="answer")
+                dspy.streaming.StreamListener(signature_field_name="reasoning"),
+                dspy.streaming.StreamListener(signature_field_name="answer"),
             ],
         )
 
         t_answer_start = time.perf_counter()
-        logger.info("[STREAM] Generating final answer...")
+        logger.info("[STREAM] Generating final answer (with CoT reasoning stream)...")
 
         final_answer: str = ""
         final_sources: list = []
         cited_papers: list = []
 
         async def _generate_tokens():
-            """Inner generator that yields already-formatted SSE strings."""
+            """Inner generator: yields formatted SSE strings for reasoning + answer."""
             nonlocal final_answer, final_sources, cited_papers, token_count
+            _emitted_thinking_end = False
             raw = streaming_program(
                 question=question, context=combined_context, history=history
             )
             async for val in raw:
                 if isinstance(val, dspy.streaming.StreamResponse) and val.chunk:
-                    token_count += 1
-                    yield format_sse({"type": "token", "content": val.chunk})
+                    field = getattr(val, "signature_field_name", "answer")
+                    if field == "reasoning":
+                        # CoT thinking trace — shown as collapsible thinking block
+                        yield format_sse({"type": "thinking_token", "content": val.chunk})
+                    else:
+                        # Transition: reasoning done, answer begins
+                        if not _emitted_thinking_end:
+                            yield format_sse({"type": "thinking_end"})
+                            _emitted_thinking_end = True
+                        token_count += 1
+                        yield format_sse({"type": "token", "content": val.chunk})
                 elif isinstance(val, dspy.Prediction):
+                    if not _emitted_thinking_end:
+                        yield format_sse({"type": "thinking_end"})
+                        _emitted_thinking_end = True
                     cited_papers = _build_cited_papers(
                         getattr(val, "sources", []), unique_papers
                     )
@@ -613,7 +689,14 @@ async def stream_dspy_response(
                         }
                     )
 
-        async for sse_chunk in _keepalive_wrap(_generate_tokens(), interval=15.0):
+        # Emit a keepalive comment before the potentially long LLM call.
+        # NOTE: We do NOT wrap _generate_tokens() with _keepalive_wrap() because
+        # DSPy's streamify uses anyio cancel scopes that must stay in the same
+        # asyncio task.  _keepalive_wrap creates separate tasks via ensure_future
+        # which violates that constraint.  Once the LLM starts generating tokens,
+        # they flow fast enough to keep the SSE connection alive.
+        yield ": keepalive\n\n"
+        async for sse_chunk in _generate_tokens():
             yield sse_chunk
 
         # ------------------------------------------------------------------ #
@@ -686,7 +769,8 @@ async def stream_dspy_response(
                                     "sources": [p.model_dump() for p in refined_cited],
                                 })
 
-                    async for r_chunk in _keepalive_wrap(_refinement_tokens(), interval=15.0):
+                    yield ": keepalive\n\n"
+                    async for r_chunk in _refinement_tokens():
                         yield r_chunk
 
             except Exception as _ge:

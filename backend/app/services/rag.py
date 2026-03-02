@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import dspy
+import mlflow
 from typing import List, Optional
 from app.services.retriever import PaperRetriever
 from app.services.planner import ResearchPlanner
@@ -195,7 +196,7 @@ class QueryGenerator(dspy.Module):
     
     def __init__(self):
         super().__init__()
-        self.generate = dspy.ChainOfThought(QueryGenerationSignature)
+        self.generate = dspy.Predict(QueryGenerationSignature)
     
     def forward(self, user_question: str) -> dspy.Prediction:
         """
@@ -268,23 +269,21 @@ class PaperRAG(dspy.Module):
             history: Conversation history for context-aware responses
             
         Returns:
-            DSPy Prediction with answer and sources
+            DSPy Prediction with answer, sources, and reasoning
         """
         # Use empty history if none provided
         if history is None:
             history = dspy.History(messages=[])
         
         # Generate answer with reasoning and history context
-        result = self.generate(
+        # IMPORTANT: Return the result directly from ChainOfThought so that
+        # dspy.streamify can intercept the 'reasoning' field for streaming.
+        # Previously we created a new Prediction which dropped 'reasoning',
+        # breaking StreamListener(signature_field_name="reasoning").
+        return self.generate(
             question=question,
             context=context,
             history=history
-        )
-        
-        return dspy.Prediction(
-            answer=result.answer,
-            sources=result.sources,
-            rationale=getattr(result, 'rationale', None)
         )
 
 
@@ -419,122 +418,136 @@ class RAGService:
         Returns:
             Dict with answer, sources, and optional rationale
         """
-        logger.info(f"[RAG] Processing question: '{question}'")
-        if history:
-            logger.info(f"[RAG] Using conversation history with {len(history)} previous turns")
-        
-        # Convert history to dspy.History format
-        dspy_history = self._convert_to_dspy_history(history)
-        
-        # Step 0: Classify intent
-        logger.info("[RAG] Classifying intent...")
-        if self.cheap_lm:
-            with dspy.context(lm=self.cheap_lm):
-                intent_res = self.intent_classifier(question=question)
-        else:
-            intent_res = self.intent_classifier(question=question)
+        with mlflow.start_run(run_name=f"RAG-Chat-{question[:30]}", nested=True):
+            mlflow.log_param("question", question)
+            mlflow.log_param("language", language)
+            mlflow.log_param("source_preference", source_preference)
             
-        logger.info(f"[RAG] Intent classified: {intent_res.category} ({intent_res.explanation})")
-        
-        if intent_res.category == "general":
-            logger.info("[RAG] General intent detected. Skipping retrieval.")
-            result = self.rag_module(
-                question=question,
-                context="No paper context needed for this general query.",
-                history=dspy_history
-            )
-            return {
-                "answer": result.answer,
-                "sources": [],
-                "rationale": getattr(result, 'rationale', None),
-                "search_query": None
-            }
-
-        # Step 1: Generate optimized search query using LLM
-        search_query = self._generate_search_query(question)
-
-        # Step 2: Retrieve context + papers together (avoids extra DB calls later)
-        logger.info(f"[RAG] Retrieving context with query: '{search_query}'")
-        context, retrieved_papers = await self.retriever.get_papers_with_context(search_query)
-
-        # Zero-result retry (Improvement 1)
-        if len(retrieved_papers) == 0 and self.query_reformulator:
-            logger.info("[RAG] No papers found. Reforming query...")
+            logger.info(f"[RAG] Processing question: '{question}'")
+            if history:
+                logger.info(f"[RAG] Using conversation history with {len(history)} previous turns")
+                mlflow.log_param("history_len", len(history))
+            
+            # Convert history to dspy.History format
+            dspy_history = self._convert_to_dspy_history(history)
+            
+            # Step 0: Classify intent
+            logger.info("[RAG] Classifying intent...")
             if self.cheap_lm:
                 with dspy.context(lm=self.cheap_lm):
-                    reformulation = self.query_reformulator(original_query=search_query)
+                    intent_res = self.intent_classifier(question=question)
             else:
-                reformulation = self.query_reformulator(original_query=search_query)
+                intent_res = self.intent_classifier(question=question)
+                
+            logger.info(f"[RAG] Intent classified: {intent_res.category} ({intent_res.explanation})")
+            mlflow.log_param("intent_category", intent_res.category)
             
-            broader_query = reformulation.broader_query.strip()
-            if broader_query and broader_query != search_query:
-                logger.info(f"[RAG] Retrying with broader query: '{broader_query}'")
-                search_query = broader_query
-                context, retrieved_papers = await self.retriever.get_papers_with_context(search_query)
+            if intent_res.category == "general":
+                logger.info("[RAG] General intent detected. Skipping retrieval.")
+                result = self.rag_module(
+                    question=question,
+                    context="No paper context needed for this general query.",
+                    history=dspy_history
+                )
+                return {
+                    "answer": result.answer,
+                    "sources": [],
+                    "rationale": getattr(result, 'reasoning', None),
+                    "search_query": None
+                }
 
-        logger.info(f"[RAG] Context retrieved (length: {len(context)} chars, {len(retrieved_papers)} papers)")
+            # Step 1: Generate optimized search query using LLM
+            search_query = self._generate_search_query(question)
+            mlflow.log_param("search_query", search_query)
 
-        # Step 3: Generate answer with history context
-        logger.info("[RAG] Generating answer with DSPy and conversation history...")
-        result = self.rag_module(
-            question=question,
-            context=context,
-            history=dspy_history
-        )
+            # Step 2: Retrieve context + papers together (avoids extra DB calls later)
+            logger.info(f"[RAG] Retrieving context with query: '{search_query}'")
+            context, retrieved_papers = await self.retriever.get_papers_with_context(search_query)
+            mlflow.log_metric("papers_retrieved", len(retrieved_papers))
 
-        cited_papers = self._build_cited_papers(
-            getattr(result, 'sources', []),
-            retrieved_papers
-        )
-
-        final_answer = result.answer
-        final_sources = cited_papers
-
-        # Adaptive gap-filling (Improvement 3)
-        if self.gap_detector:
-            try:
-                logger.info("[RAG] Checking for gaps in answer...")
+            # Zero-result retry (Improvement 1)
+            if len(retrieved_papers) == 0 and self.query_reformulator:
+                logger.info("[RAG] No papers found. Reforming query...")
                 if self.cheap_lm:
                     with dspy.context(lm=self.cheap_lm):
-                        gap_result = self.gap_detector(question=question, answer=final_answer)
+                        reformulation = self.query_reformulator(original_query=search_query)
                 else:
-                    gap_result = self.gap_detector(question=question, answer=final_answer)
+                    reformulation = self.query_reformulator(original_query=search_query)
                 
-                if getattr(gap_result, "verdict", "complete") == "partial" and getattr(gap_result, "gap_query", "").strip():
-                    gap_q = gap_result.gap_query.strip()
-                    logger.info(f"[RAG] Gap detected. Refining with query: '{gap_q}'")
-                    
-                    extra_context, extra_papers = await self.retriever.get_papers_with_context(gap_q)
-                    
-                    if extra_papers:
-                        # Combine context and deduplicate papers
-                        enriched_context = context + "\n\n" + extra_context
-                        seen_ids = {p.id for p in retrieved_papers}
-                        all_unique_papers = retrieved_papers + [p for p in extra_papers if p.id not in seen_ids]
-                        
-                        logger.info("[RAG] Generating refined answer...")
-                        refined_result = self.rag_module(
-                            question=question,
-                            context=enriched_context,
-                            history=dspy_history
-                        )
-                        
-                        final_answer = refined_result.answer
-                        final_sources = self._build_cited_papers(
-                            getattr(refined_result, 'sources', []),
-                            all_unique_papers
-                        )
-            except Exception as e:
-                logger.warning(f"[RAG] Gap detection/refinement failed: {e}")
+                broader_query = reformulation.broader_query.strip()
+                if broader_query and broader_query != search_query:
+                    logger.info(f"[RAG] Retrying with broader query: '{broader_query}'")
+                    search_query = broader_query
+                    mlflow.log_param("broader_search_query", search_query)
+                    context, retrieved_papers = await self.retriever.get_papers_with_context(search_query)
+                    mlflow.log_metric("papers_retrieved_after_retry", len(retrieved_papers))
 
-        logger.info(f"[RAG] Final answer generated ({len(final_answer)} chars, {len(final_sources)} cited papers)")
+            logger.info(f"[RAG] Context retrieved (length: {len(context)} chars, {len(retrieved_papers)} papers)")
 
-        return {
-            "answer": final_answer,
-            "sources": final_sources,
-            "rationale": getattr(result, 'rationale', None),
-            "search_query": search_query
-        }
+            # Step 3: Generate answer with history context
+            logger.info("[RAG] Generating answer with DSPy and conversation history...")
+            result = self.rag_module(
+                question=question,
+                context=context,
+                history=dspy_history
+            )
+
+            cited_papers = self._build_cited_papers(
+                getattr(result, 'sources', []),
+                retrieved_papers
+            )
+
+            final_answer = result.answer
+            final_sources = cited_papers
+
+            # Adaptive gap-filling (Improvement 3)
+            if self.gap_detector:
+                try:
+                    logger.info("[RAG] Checking for gaps in answer...")
+                    if self.cheap_lm:
+                        with dspy.context(lm=self.cheap_lm):
+                            gap_result = self.gap_detector(question=question, answer=final_answer)
+                    else:
+                        gap_result = self.gap_detector(question=question, answer=final_answer)
+                    
+                    if getattr(gap_result, "verdict", "complete") == "partial" and getattr(gap_result, "gap_query", "").strip():
+                        gap_q = gap_result.gap_query.strip()
+                        logger.info(f"[RAG] Gap detected. Refining with query: '{gap_q}'")
+                        mlflow.log_param("gap_query", gap_q)
+                        
+                        extra_context, extra_papers = await self.retriever.get_papers_with_context(gap_q)
+                        
+                        if extra_papers:
+                            # Combine context and deduplicate papers
+                            enriched_context = context + "\n\n" + extra_context
+                            seen_ids = {p.id for p in retrieved_papers}
+                            all_unique_papers = retrieved_papers + [p for p in extra_papers if p.id not in seen_ids]
+                            
+                            logger.info("[RAG] Generating refined answer...")
+                            refined_result = self.rag_module(
+                                question=question,
+                                context=enriched_context,
+                                history=dspy_history
+                            )
+                            
+                            final_answer = refined_result.answer
+                            final_sources = self._build_cited_papers(
+                                getattr(refined_result, 'sources', []),
+                                all_unique_papers
+                            )
+                            mlflow.log_param("gap_filling_used", True)
+                except Exception as e:
+                    logger.warning(f"[RAG] Gap detection/refinement failed: {e}")
+
+            logger.info(f"[RAG] Final answer generated ({len(final_answer)} chars, {len(final_sources)} cited papers)")
+            mlflow.log_metric("cited_papers_count", len(final_sources))
+
+            return {
+                "answer": final_answer,
+                "sources": final_sources,
+                "rationale": getattr(result, 'reasoning', None),
+                "search_query": search_query
+            }
     
     async def generate_title(self, question: str, answer: str) -> str:
         """

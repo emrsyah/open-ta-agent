@@ -65,6 +65,12 @@ python main.py
 
 Open `frontend/index.html` in your browser (or use Live Server extension).
 
+### 6. Run MLFlow
+
+```bash
+mlflow server --backend-store-uri sqlite:///mlflow.sqlite
+```
+
 ---
 
 ## 🎯 Features

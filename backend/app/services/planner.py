@@ -107,21 +107,44 @@ class ResearchPlanner(dspy.Module):
     def create_plan(
         self, question: str, is_research: bool, cheap_lm=None
     ) -> List[PlanStep]:
-        ctx = dspy.context(lm=cheap_lm) if cheap_lm else contextlib.nullcontext()
-        with ctx:
+        """
+        Generate a research plan using the MAIN LLM (never cheap_lm).
+
+        The planner must produce a well-formed nested JSON structure
+        (List[SmartPlanStep]). Cheap/fast models often have low max_tokens
+        and truncate mid-JSON, causing adapter parse failures.  We therefore
+        always let the globally active (main) LM handle planning.
+
+        `cheap_lm` is accepted here only for API compatibility; it is NOT
+        used for the plan generation call itself.  It IS passed through to
+        step_thinker calls in streaming.py.
+        """
+        try:
+            # Always run with the main LM (no cheap_lm context here)
             result = self.planner(question=question, is_research=is_research)
+            steps: List[PlanStep] = result.steps or []
 
-        steps: List[PlanStep] = result.steps or []
-        # Guarantee sequential ids
-        for i, step in enumerate(steps):
-            step.id = i
+            if not steps:
+                logger.warning("[PLANNER] LM returned empty steps list — using default plan")
+                return default_plan(is_research)
 
-        logger.info(
-            "[PLANNER] Created plan with %d step(s): %s",
-            len(steps),
-            [s.title for s in steps],
-        )
-        return steps
+            # Guarantee sequential ids
+            for i, step in enumerate(steps):
+                step.id = i
+
+            logger.info(
+                "[PLANNER] Created plan with %d step(s): %s",
+                len(steps),
+                [s.title for s in steps],
+            )
+            return steps
+
+        except Exception as e:
+            logger.warning(
+                "[PLANNER] Failed to generate plan (%s: %s) — falling back to default plan",
+                type(e).__name__, e,
+            )
+            return default_plan(is_research)
 
 
 def default_plan(is_research: bool) -> List[SmartPlanStep]:

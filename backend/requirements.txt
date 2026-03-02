@@ -14,6 +14,11 @@ pydantic-settings
 
 # AI Framework
 dspy-ai
+mlflow>=2.21.1
+
+# Agentic Orchestration (LangGraph)
+langgraph
+langchain-core
 
 # Additional dependencies for DSPy
 litellm[proxy]

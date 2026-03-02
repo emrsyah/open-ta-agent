@@ -87,6 +87,10 @@ class Settings(BaseSettings):
     # Redis
     REDIS_URL: str = "redis://localhost:6379"
 
+    # MLflow Tracing
+    MLFLOW_TRACKING_URI: str = "http://localhost:5000"
+    MLFLOW_EXPERIMENT: str = "OpenTA-DSPy-Tracing"
+
     # Database Pool Settings
     DB_POOL_SIZE: int = 5
     DB_MAX_OVERFLOW: int = 10
