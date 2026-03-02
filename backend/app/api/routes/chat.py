@@ -7,6 +7,7 @@ import mlflow
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from langfuse import observe, get_client
 
 from app.core.models import ChatRequest, ChatResponse, CitationAudit
 from app.services.rag import get_rag_service
@@ -81,6 +82,7 @@ async def _save_title(
 
 
 @router.post("/basic", response_model=ChatResponse)
+@observe(name="chat-basic")
 async def chat_basic(
     request: ChatRequest,
     background_tasks: BackgroundTasks,
@@ -94,6 +96,18 @@ async def chat_basic(
     conversation_id = request.get_conversation_id()
     user_id = current_user  # From verified JWT, not request body
     meta_params = request.meta_params
+
+    # Tag this Langfuse trace with useful metadata
+    try:
+        langfuse = get_client()
+        langfuse.update_current_trace(
+            session_id=conversation_id or "anonymous",
+            user_id=user_id or "anonymous",
+            input={"query": query},
+            tags=["chat-basic", "dspy"],
+        )
+    except Exception as exc:
+        logger.debug("Langfuse trace tagging skipped: %s", exc)
 
     # Load history (Redis → DB fallback, capped at last 5 turns)
     raw_history = await _load_history(conversation_id, meta_params.is_incognito, user_id)
@@ -221,6 +235,7 @@ async def _generate_and_save_title_bg(
 # ------------------------------------------------------------------ #
 
 @router.post("/new", response_model=ChatResponse)
+@observe(name="chat-new-lg")
 async def chat_new(
     request: ChatRequest,
     background_tasks: BackgroundTasks,
@@ -240,6 +255,18 @@ async def chat_new(
     conversation_id = request.get_conversation_id()
     user_id = current_user
     meta_params = request.meta_params
+
+    # Tag this Langfuse trace with useful metadata
+    try:
+        langfuse = get_client()
+        langfuse.update_current_trace(
+            session_id=conversation_id or "anonymous",
+            user_id=user_id or "anonymous",
+            input={"query": query},
+            tags=["chat-new", "langgraph"],
+        )
+    except Exception as exc:
+        logger.debug("Langfuse trace tagging skipped: %s", exc)
 
     # Load history (same logic as /chat/basic)
     raw_history = await _load_history(conversation_id, meta_params.is_incognito, user_id)

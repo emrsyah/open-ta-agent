@@ -5,6 +5,7 @@ This is the refactored, maintainable version of the backend.
 """
 
 import logging
+import os
 
 import dspy
 import mlflow
@@ -75,6 +76,28 @@ async def lifespan(app: FastAPI):
         logger.info("MLflow Tracing initialized at %s", settings.MLFLOW_TRACKING_URI)
     except Exception as e:
         logger.warning("Failed to initialize MLflow Tracing: %s", e)
+
+    # Configure Langfuse via LiteLLM OTEL callback (Langfuse v3 compatible)
+    # All DSPy → LiteLLM calls will auto-report to Langfuse
+    if settings.LANGFUSE_ENABLED and settings.LANGFUSE_PUBLIC_KEY:
+        try:
+            import litellm
+
+            # Ensure Langfuse env vars are set for both Langfuse SDK and LiteLLM OTEL
+            os.environ.setdefault("LANGFUSE_PUBLIC_KEY", settings.LANGFUSE_PUBLIC_KEY)
+            if settings.LANGFUSE_SECRET_KEY:
+                os.environ.setdefault("LANGFUSE_SECRET_KEY", settings.LANGFUSE_SECRET_KEY)
+            os.environ.setdefault("LANGFUSE_HOST", settings.LANGFUSE_BASE_URL)
+
+            # Use the OTEL-based integration (works with Langfuse v3+)
+            litellm.callbacks = ["langfuse_otel"]
+
+            # Initialize the Langfuse client so @observe decorators work
+            from langfuse import Langfuse
+            _langfuse_client = Langfuse()
+            logger.info("Langfuse tracing enabled via OTEL integration")
+        except Exception as e:
+            logger.warning("Failed to initialize Langfuse: %s", e)
 
     app.state.main_lm = main_lm
     app.state.cheap_lm = cheap_lm

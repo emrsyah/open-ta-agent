@@ -16,6 +16,7 @@ import logging
 from typing import Any, Literal
 
 import dspy
+from langfuse import observe
 from langgraph.config import get_stream_writer
 from langgraph.types import Command
 
@@ -34,12 +35,15 @@ logger = logging.getLogger(__name__)
 # Helpers (re-used from streaming.py patterns)
 # ---------------------------------------------------------------------------
 
-async def _run_dspy_sync(fn, cheap_lm=None, **kwargs):
-    """Run a blocking DSPy call in a thread pool."""
+async def _run_dspy_sync(fn, cheap_lm=None, span_name=None, **kwargs):
+    """Run a blocking DSPy call in a thread pool with optional Langfuse span."""
     def _call():
         ctx = dspy.context(lm=cheap_lm) if cheap_lm else contextlib.nullcontext()
         with ctx:
             return fn(**kwargs)
+
+    if span_name:
+        _call = observe(name=span_name)(_call)
     return await asyncio.to_thread(_call)
 
 
@@ -56,6 +60,7 @@ def _paper_summary(papers: list) -> str:
 # Node: classify_intent
 # ---------------------------------------------------------------------------
 
+@observe(name="Classify Intent & Generate Query")
 async def classify_intent(state: RAGGraphState) -> Command[Literal[
     "acknowledge", "generate_answer_general"
 ]]:
@@ -80,11 +85,11 @@ async def classify_intent(state: RAGGraphState) -> Command[Literal[
 
     if intent_classifier:
         intent_task = asyncio.create_task(
-            _run_dspy_sync(intent_classifier, cheap_lm=cheap_lm, question=question)
+            _run_dspy_sync(intent_classifier, cheap_lm=cheap_lm, span_name="Intent Classification", question=question)
         )
     if query_generator:
         query_task = asyncio.create_task(
-            _run_dspy_sync(query_generator, cheap_lm=cheap_lm, user_question=question)
+            _run_dspy_sync(query_generator, cheap_lm=cheap_lm, span_name="Search Query Pre-Generation", user_question=question)
         )
 
     # Await intent classification
@@ -137,6 +142,7 @@ async def classify_intent(state: RAGGraphState) -> Command[Literal[
 # Node: acknowledge
 # ---------------------------------------------------------------------------
 
+@observe(name="Generate Acknowledgment")
 async def acknowledge(state: RAGGraphState) -> dict:
     """Generate acknowledgment for research questions, then go to plan."""
     writer = get_stream_writer()
@@ -147,7 +153,7 @@ async def acknowledge(state: RAGGraphState) -> dict:
     if ack_gen:
         try:
             ack_result = await _run_dspy_sync(
-                ack_gen, cheap_lm=cheap_lm, question=question
+                ack_gen, cheap_lm=cheap_lm, span_name="Acknowledgment Generation", question=question
             )
             ack_text = getattr(ack_result, "acknowledgment", "")
             if ack_text:
@@ -163,6 +169,7 @@ async def acknowledge(state: RAGGraphState) -> dict:
 # Node: create_plan
 # ---------------------------------------------------------------------------
 
+@observe(name="Create Research Plan")
 async def create_plan(state: RAGGraphState) -> dict:
     """Generate a research plan using the DSPy ResearchPlanner."""
     writer = get_stream_writer()
@@ -176,11 +183,12 @@ async def create_plan(state: RAGGraphState) -> dict:
 
     if planner and not use_default:
         try:
-            steps = await asyncio.to_thread(
-                lambda: planner.create_plan(
+            @observe(name="Plan Step Generation")
+            def _create_plan():
+                return planner.create_plan(
                     question=question, is_research=True, cheap_lm=cheap_lm
                 )
-            )
+            steps = await asyncio.to_thread(_create_plan)
             logger.info("[LG-NODE] Planner created %d steps", len(steps))
         except Exception as e:
             logger.warning("[LG-NODE] Planner failed (%s) — using default plan", e)
@@ -201,6 +209,7 @@ async def create_plan(state: RAGGraphState) -> dict:
 # Node: execute_step (search + thinking for one plan step)
 # ---------------------------------------------------------------------------
 
+@observe(name="Execute Research Step")
 async def execute_step(state: RAGGraphState) -> dict:
     """Execute a single plan step: optional search + thinking.
     
@@ -332,6 +341,7 @@ async def execute_step(state: RAGGraphState) -> dict:
 # Node: generate_answer_general (for non-research questions)
 # ---------------------------------------------------------------------------
 
+@observe(name="Generate Answer (General)")
 async def generate_answer_general(state: RAGGraphState) -> dict:
     """Generate answer for general (non-research) questions using DSPy PaperRAG."""
     writer = get_stream_writer()
@@ -389,6 +399,7 @@ async def generate_answer_general(state: RAGGraphState) -> dict:
 # Node: generate_answer (for research questions, after all steps)
 # ---------------------------------------------------------------------------
 
+@observe(name="Generate Final Answer")
 async def generate_answer(state: RAGGraphState) -> dict:
     """Generate the final answer using accumulated context from all steps."""
     writer = get_stream_writer()
@@ -484,6 +495,7 @@ async def generate_answer(state: RAGGraphState) -> dict:
 # Node: detect_gap
 # ---------------------------------------------------------------------------
 
+@observe(name="Detect Knowledge Gap")
 async def detect_gap(state: RAGGraphState) -> Command[Literal[
     "refine_answer", "post_answer"
 ]]:
@@ -499,7 +511,7 @@ async def detect_gap(state: RAGGraphState) -> Command[Literal[
 
     try:
         gap_result = await _run_dspy_sync(
-            gap_detector, cheap_lm=cheap_lm,
+            gap_detector, cheap_lm=cheap_lm, span_name="Gap Analysis",
             question=question, answer=final_answer,
         )
         verdict = getattr(gap_result, "verdict", "complete")
@@ -523,6 +535,7 @@ async def detect_gap(state: RAGGraphState) -> Command[Literal[
 # Node: refine_answer
 # ---------------------------------------------------------------------------
 
+@observe(name="Refine Answer")
 async def refine_answer(state: RAGGraphState) -> dict:
     """Re-generate answer with enriched context after gap detection."""
     writer = get_stream_writer()
@@ -532,14 +545,15 @@ async def refine_answer(state: RAGGraphState) -> dict:
     retriever = state.get("retriever")
     all_papers = state.get("all_papers", [])
     all_context_parts = state.get("all_context_parts", [])
-    gap_query = state.get("gap_query_text", "")
+    gap_query = state.get("gap_query_text", "").strip()
 
     if history is None:
         import dspy as _dspy
         history = _dspy.History(messages=[])
 
-    # Retrieve additional context for the gap
-    extra_context, extra_papers = await retriever.get_papers_with_context(gap_query)
+    # Retrieve additional context for the gap (fall back to original question if empty)
+    search_query = gap_query or question
+    extra_context, extra_papers = await retriever.get_papers_with_context(search_query)
     writer({"type": "refinement_search", "paper_count": len(extra_papers)})
 
     # Merge papers
@@ -601,6 +615,7 @@ async def refine_answer(state: RAGGraphState) -> dict:
 # Node: post_answer (callbacks: on_complete, generate_title)
 # ---------------------------------------------------------------------------
 
+@observe(name="Post-Answer Processing")
 async def post_answer(state: RAGGraphState) -> dict:
     """Handle post-answer tasks: save history, generate title."""
     writer = get_stream_writer()

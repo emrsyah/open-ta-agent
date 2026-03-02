@@ -91,6 +91,12 @@ class Settings(BaseSettings):
     MLFLOW_TRACKING_URI: str = "http://localhost:5000"
     MLFLOW_EXPERIMENT: str = "OpenTA-DSPy-Tracing"
 
+    # Langfuse Observability
+    LANGFUSE_SECRET_KEY: Optional[str] = None
+    LANGFUSE_PUBLIC_KEY: Optional[str] = None
+    LANGFUSE_BASE_URL: str = "https://cloud.langfuse.com"
+    LANGFUSE_ENABLED: bool = True
+
     # Database Pool Settings
     DB_POOL_SIZE: int = 5
     DB_MAX_OVERFLOW: int = 10

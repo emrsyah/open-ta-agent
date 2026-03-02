@@ -14,6 +14,7 @@ import logging
 from typing import Any, AsyncGenerator, List, Optional
 
 import dspy
+from langfuse import observe
 
 from app.services.retriever import PaperRetriever
 from app.services.planner import ResearchPlanner
@@ -214,6 +215,7 @@ class RAGServiceLangGraph:
             yield format_sse({"type": "error", "content": str(e)})
             yield "data: [DONE]\n\n"
 
+    @observe(name="Title Generation")
     async def generate_title(self, question: str, answer: str) -> str:
         """Generate conversation title (same as original RAGService)."""
         try:
