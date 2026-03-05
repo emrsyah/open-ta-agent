@@ -68,3 +68,9 @@ class RAGGraphState(TypedDict, total=False):
     on_complete: Any  # async callable(answer, sources, search_query)
     generate_title_fn: Any  # async callable(question, answer) -> str
     is_first_message: bool
+    
+    # ── Session context (for context-aware planning) ─────────────────────
+    session_papers: list  # All papers retrieved in this conversation (from Redis/DB)
+    last_answer: str  # Previous answer for follow-up context
+    last_sources: list  # Previous sources for citation resolution
+    needs_retrieval: bool  # Planner's decision on whether new retrieval is needed

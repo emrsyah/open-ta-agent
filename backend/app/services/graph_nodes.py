@@ -171,39 +171,60 @@ async def acknowledge(state: RAGGraphState) -> dict:
 
 @observe(name="Create Research Plan")
 async def create_plan(state: RAGGraphState) -> dict:
-    """Generate a research plan using the DSPy ResearchPlanner."""
+    """Generate a context-aware research plan using the DSPy ResearchPlanner.
+    
+    Passes session context (existing papers, last answer) to enable
+    smart planning for follow-up questions like "compare [1] and [2]".
+    """
     writer = get_stream_writer()
     writer({"type": "status", "step": "planning", "message": "Planning approach..."})
 
     question = state["question"]
     cheap_lm = state.get("cheap_lm")
     planner = state.get("planner")
+    
+    # Get session context for context-aware planning
+    session_papers = state.get("session_papers", [])
+    last_answer = state.get("last_answer", "")
 
     use_default = _should_use_default_plan(question)
 
+    needs_retrieval = True
+    
     if planner and not use_default:
         try:
             @observe(name="Plan Step Generation")
             def _create_plan():
                 return planner.create_plan(
-                    question=question, is_research=True, cheap_lm=cheap_lm
+                    question=question,
+                    is_research=True,
+                    session_papers=session_papers,
+                    last_answer=last_answer,
+                    cheap_lm=cheap_lm
                 )
-            steps = await asyncio.to_thread(_create_plan)
-            logger.info("[LG-NODE] Planner created %d steps", len(steps))
+            needs_retrieval, steps = await asyncio.to_thread(_create_plan)
+            logger.info(
+                "[LG-NODE] Planner created %d steps, needs_retrieval=%s",
+                len(steps), needs_retrieval
+            )
         except Exception as e:
             logger.warning("[LG-NODE] Planner failed (%s) — using default plan", e)
-            steps = default_plan(True)
+            needs_retrieval, steps = True, default_plan(True)
     else:
-        steps = default_plan(True)
+        needs_retrieval, steps = True, default_plan(True)
         logger.info("[LG-NODE] Using default plan (heuristic)")
 
     writer({
         "type": "plan",
         "steps": [s.model_dump() for s in steps],
+        "needs_retrieval": needs_retrieval,
     })
 
-    return {"plan_steps": steps, "current_step_idx": 0}
-
+    return {
+        "plan_steps": steps,
+        "current_step_idx": 0,
+        "needs_retrieval": needs_retrieval,
+    }
 
 # ---------------------------------------------------------------------------
 # Node: execute_step (search + thinking for one plan step)
@@ -211,7 +232,14 @@ async def create_plan(state: RAGGraphState) -> dict:
 
 @observe(name="Execute Research Step")
 async def execute_step(state: RAGGraphState) -> dict:
-    """Execute a single plan step: optional search + thinking.
+    """Execute a single plan step based on its action_type.
+    
+    Action types:
+    - search/research: Retrieve new papers from database
+    - compare/summarize/analyze/extract: Use existing papers (no retrieval)
+    - clarify: Use previous answer context
+    - deep_dive: Fetch full PDF (future)
+    - synthesis: Combine findings without new search
     
     After execution, the graph edge goes to route_steps_node
     which decides if more steps remain.
@@ -231,72 +259,160 @@ async def execute_step(state: RAGGraphState) -> dict:
     query_reformulator = state.get("query_reformulator")
     query_decomposer = state.get("query_decomposer")
     planner = state.get("planner")
+    rag_module = state.get("rag_module")
+    history = state.get("history")
 
     existing_papers = state.get("all_papers", [])
+    session_papers = state.get("session_papers", [])
+    last_answer = state.get("last_answer", "")
 
     writer({
         "type": "step_start",
         "step_id": step.id,
         "title": step.title,
         "description": step.description,
+        "action_type": step.action_type,
     })
 
     new_papers = []
     new_context = []
 
-    # Search action (if needed)
-    if step.needs_search and retriever:
-        pre_generated_query = state.get("pre_generated_query") if idx == 0 else None
+    # ── Handle different action types ──────────────────────────────────────
+    
+    if step.action_type in ("search", "research"):
+        # ── SEARCH: Retrieve new papers from database ──────────────────────
+        if retriever:
+            pre_generated_query = state.get("pre_generated_query") if idx == 0 else None
 
-        # Import and re-use the search step helper from streaming.py
-        from app.utils.streaming import _execute_search_step
+            from app.utils.streaming import _execute_search_step
 
-        if pre_generated_query is None:
+            if pre_generated_query is None:
+                writer({
+                    "type": "step_action",
+                    "step_id": step.id,
+                    "action": "generating_query",
+                })
+
+            search_query, papers, context, original_query = await _execute_search_step(
+                step, question, retriever, query_generator, cheap_lm,
+                pre_generated_query=pre_generated_query,
+                query_reformulator=query_reformulator,
+                query_decomposer=query_decomposer,
+                paper_offset=len(existing_papers),
+            )
+
+            if original_query is not None:
+                writer({
+                    "type": "step_action",
+                    "step_id": step.id,
+                    "action": "reformulated_query",
+                    "original_query": original_query,
+                    "query": search_query,
+                })
+
+            new_papers = papers
+            new_context = [context] if context else []
+
             writer({
                 "type": "step_action",
                 "step_id": step.id,
-                "action": "generating_query",
-            })
-
-        search_query, papers, context, original_query = await _execute_search_step(
-            step, question, retriever, query_generator, cheap_lm,
-            pre_generated_query=pre_generated_query,
-            query_reformulator=query_reformulator,
-            query_decomposer=query_decomposer,
-            paper_offset=len(existing_papers),
-        )
-
-        # Emit reformulation notice if it happened
-        if original_query is not None:
-            writer({
-                "type": "step_action",
-                "step_id": step.id,
-                "action": "reformulated_query",
-                "original_query": original_query,
+                "action": "search",
                 "query": search_query,
             })
-
-        new_papers = papers
-        new_context = [context] if context else []
-
+            writer({
+                "type": "step_action_result",
+                "step_id": step.id,
+                "action": "search",
+                "paper_count": len(papers),
+            })
+    
+    elif step.action_type in ("compare", "summarize", "analyze", "extract"):
+        # ── CONTEXTUAL: Use existing papers without retrieval ───────────────
         writer({
             "type": "step_action",
             "step_id": step.id,
-            "action": "search",
-            "query": search_query,
+            "action": step.action_type,
+            "using_existing_papers": True,
         })
+        
+        # Resolve which papers to use
+        if step.use_cited_papers:
+            # Use specific papers by citation number
+            papers_to_use = [
+                p for p in session_papers
+                if p.get("citation_number") in step.use_cited_papers
+            ]
+            writer({
+                "type": "step_action",
+                "step_id": step.id,
+                "action": "resolved_citations",
+                "cited_papers": step.use_cited_papers,
+                "resolved_count": len(papers_to_use),
+            })
+        else:
+            # Use all session papers
+            papers_to_use = session_papers
+        
+        # Build context from papers (no retrieval needed)
+        if papers_to_use:
+            context = _build_context_from_papers(papers_to_use, step.action_type)
+            new_context = [context]
+            # Don't add to new_papers since these are already in session
+            writer({
+                "type": "step_action_result",
+                "step_id": step.id,
+                "action": step.action_type,
+                "papers_used": len(papers_to_use),
+            })
+        else:
+            writer({
+                "type": "warning",
+                "step_id": step.id,
+                "message": f"No papers found for {step.action_type} action",
+            })
+    
+    elif step.action_type == "clarify":
+        # ── CLARIFY: Re-explain previous answer ─────────────────────────────
         writer({
-            "type": "step_action_result",
+            "type": "step_action",
             "step_id": step.id,
-            "action": "search",
-            "paper_count": len(papers),
+            "action": "clarify",
+            "has_previous_answer": bool(last_answer),
         })
+        
+        if last_answer:
+            # Use last answer as context
+            new_context = [f"Previous answer to clarify:\n{last_answer}"]
+        else:
+            writer({
+                "type": "warning",
+                "message": "No previous answer to clarify",
+            })
+    
+    elif step.action_type == "synthesis":
+        # ── SYNTHESIS: Combine existing findings ────────────────────────────
+        writer({
+            "type": "step_action",
+            "step_id": step.id,
+            "action": "synthesis",
+            "existing_papers": len(existing_papers),
+        })
+        # No new retrieval, just mark that we're synthesizing
+    
+    elif step.action_type == "deep_dive":
+        # ── DEEP DIVE: Future - fetch full PDF ─────────────────────────────
+        writer({
+            "type": "step_action",
+            "step_id": step.id,
+            "action": "deep_dive",
+            "status": "not_yet_implemented",
+        })
+        logger.warning("[LG-NODE] deep_dive action not yet implemented")
 
-    # Step thinking (stream via writer)
-    if planner:
+    # ── Step thinking (stream via writer) ───────────────────────────────────
+    if planner and step.action_type not in ("clarify",):
         gathered = _paper_summary(existing_papers + new_papers)
         try:
-            # Use dspy.streamify for streaming thinking tokens
             streaming_thinker = dspy.streamify(
                 planner.step_thinker,
                 stream_listeners=[
@@ -325,7 +441,6 @@ async def execute_step(state: RAGGraphState) -> dict:
 
     writer({"type": "step_done", "step_id": step.id})
 
-    # Clear pre_generated_query after first step uses it
     update = {
         "current_step_idx": idx + 1,
         "all_papers": new_papers,
@@ -336,6 +451,56 @@ async def execute_step(state: RAGGraphState) -> dict:
 
     return update
 
+
+def _build_context_from_papers(papers: list, action_type: str) -> str:
+    """Build context string from papers for contextual actions."""
+    if not papers:
+        return "No papers available for this action."
+    
+    lines = []
+    
+    if action_type == "compare":
+        lines.append("Papers to compare:")
+        for p in papers:
+            cn = p.get("citation_number", "?")
+            lines.append(f"\n[{cn}] {p.get('title', 'Unknown')}")
+            lines.append(f"    Authors: {', '.join(p.get('authors', ['Unknown']))}")
+            lines.append(f"    Year: {p.get('year', 'Unknown')}")
+            if p.get('abstract'):
+                lines.append(f"    Abstract: {p['abstract'][:500]}...")
+    
+    elif action_type == "summarize":
+        lines.append("Papers to summarize:")
+        for p in papers:
+            cn = p.get("citation_number", "?")
+            lines.append(f"\n[{cn}] {p.get('title', 'Unknown')}")
+            lines.append(f"    Abstract: {p.get('abstract', 'No abstract available')}")
+    
+    elif action_type == "analyze":
+        lines.append("Papers for analysis:")
+        for p in papers:
+            cn = p.get("citation_number", "?")
+            lines.append(f"\n[{cn}] {p.get('title', 'Unknown')}")
+            lines.append(f"    Year: {p.get('year', 'Unknown')}")
+            lines.append(f"    Abstract: {p.get('abstract', '')}")
+            if p.get('keywords'):
+                lines.append(f"    Keywords: {', '.join(p['keywords'])}")
+    
+    elif action_type == "extract":
+        lines.append("Papers for extraction:")
+        for p in papers:
+            cn = p.get("citation_number", "?")
+            lines.append(f"\n[{cn}] {p.get('title', 'Unknown')}")
+            lines.append(f"    Authors: {', '.join(p.get('authors', ['Unknown']))}")
+            lines.append(f"    Abstract: {p.get('abstract', '')}")
+    
+    else:
+        # Generic fallback
+        for p in papers:
+            cn = p.get("citation_number", "?")
+            lines.append(f"[{cn}] {p.get('title', 'Unknown')} ({p.get('year', 'Unknown')})")
+    
+    return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
 # Node: generate_answer_general (for non-research questions)
@@ -617,7 +782,7 @@ async def refine_answer(state: RAGGraphState) -> dict:
 
 @observe(name="Post-Answer Processing")
 async def post_answer(state: RAGGraphState) -> dict:
-    """Handle post-answer tasks: save history, generate title."""
+    """Handle post-answer tasks: save history, generate title, update session context."""
     writer = get_stream_writer()
     final_answer = state.get("final_answer", "")
     final_sources = state.get("final_sources", [])
@@ -625,7 +790,9 @@ async def post_answer(state: RAGGraphState) -> dict:
     generate_title_fn = state.get("generate_title_fn")
     question = state["question"]
     is_first_message = state.get("is_first_message", False)
-
+    conversation_id = state.get("conversation_id")
+    is_incognito = state.get("is_incognito", False)
+    
     # Save history
     if on_complete:
         try:
@@ -636,6 +803,27 @@ async def post_answer(state: RAGGraphState) -> dict:
             )
         except Exception as e:
             logger.warning("[LG-NODE] on_complete callback failed: %s", e)
+    
+    # Update session context (papers + last answer) for context-aware planning
+    if conversation_id and not is_incognito:
+        try:
+            from app.services.session_manager import get_session_manager
+            session_manager = get_session_manager()
+            
+            # Save last answer and sources
+            await session_manager.set_last_answer(
+                conversation_id=conversation_id,
+                answer=final_answer,
+                sources=final_sources,
+            )
+            
+            logger.info(
+                "[LG-NODE] Updated session context for %s: %d sources",
+                conversation_id,
+                len(final_sources),
+            )
+        except Exception as e:
+            logger.warning("[LG-NODE] Failed to update session context: %s", e)
 
     # Generate title
     title = None
@@ -647,5 +835,4 @@ async def post_answer(state: RAGGraphState) -> dict:
             logger.warning("[LG-NODE] Title generation failed: %s", e)
 
     return {"title": title}
-
 

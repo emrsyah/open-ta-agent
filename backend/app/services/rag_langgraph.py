@@ -80,7 +80,7 @@ class RAGServiceLangGraph:
 
         return dspy.History(messages=dspy_messages)
 
-    def _build_initial_state(
+    async def _build_initial_state(
         self,
         question: str,
         history: Optional[List[dict]] = None,
@@ -93,8 +93,32 @@ class RAGServiceLangGraph:
         generate_title_fn: Any = None,
         is_first_message: bool = False,
     ) -> RAGGraphState:
-        """Build the initial state dict for the LangGraph invocation."""
+        """Build the initial state dict for the LangGraph invocation.
+        
+        Loads session context (papers, last answer) for context-aware planning.
+        """
         dspy_history = self._convert_to_dspy_history(history)
+        
+        # Load session context for context-aware planning
+        session_papers = []
+        last_answer = ""
+        
+        if conversation_id and not is_incognito:
+            try:
+                from app.services.session_manager import get_session_manager
+                session_manager = get_session_manager()
+                
+                # Load papers and last answer in parallel
+                session_papers = await session_manager.get_session_papers(conversation_id)
+                last_answer = await session_manager.get_last_answer(conversation_id)
+                
+                logger.info(
+                    "[RAG-LG] Loaded session context: %d papers, last_answer_len=%d",
+                    len(session_papers),
+                    len(last_answer),
+                )
+            except Exception as e:
+                logger.warning("[RAG-LG] Failed to load session context: %s", e)
 
         return {
             # Input
@@ -123,6 +147,11 @@ class RAGServiceLangGraph:
             "current_step_idx": 0,
             "all_papers": [],
             "all_context_parts": [],
+            # Session context (for context-aware planning)
+            "session_papers": session_papers,
+            "last_answer": last_answer,
+            "last_sources": [],
+            "needs_retrieval": True,
             # Output
             "final_answer": "",
             "final_sources": [],
@@ -143,7 +172,7 @@ class RAGServiceLangGraph:
         source_preference: str = "all",
     ) -> dict:
         """Non-streaming chat (mirrors original RAGService.chat)."""
-        state = self._build_initial_state(
+        state = await self._build_initial_state(
             question=question,
             history=history,
             language=language,
@@ -179,7 +208,7 @@ class RAGServiceLangGraph:
         """
         from app.utils.streaming import format_sse
 
-        state = self._build_initial_state(
+        state = await self._build_initial_state(
             question=question,
             history=history,
             language=language,
@@ -214,7 +243,6 @@ class RAGServiceLangGraph:
             logger.error("[RAG-LG] Stream error: %s", e, exc_info=True)
             yield format_sse({"type": "error", "content": str(e)})
             yield "data: [DONE]\n\n"
-
     @observe(name="Title Generation")
     async def generate_title(self, question: str, answer: str) -> str:
         """Generate conversation title (same as original RAGService)."""

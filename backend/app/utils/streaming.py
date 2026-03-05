@@ -148,19 +148,55 @@ async def _keepalive_wrap(
                 await pending
 
 
-def _should_use_default_plan(question: str) -> bool:
+def _should_use_default_plan(question: str, session_papers: list | None = None) -> bool:
     """
     Heuristic: use default_plan (skip the planner LLM call) for simple questions.
-    A question is considered simple if it has fewer than 20 words and no
-    multi-faceted keywords that suggest a comparative or multi-step analysis.
+    
+    A question is considered simple if:
+    1. It has fewer than 20 words AND
+    2. No multi-faceted keywords that suggest comparative or multi-step analysis
+    3. AND it's NOT a contextual follow-up (compare [1] and [2], etc.)
+    
+    Contextual follow-ups should ALWAYS go through the planner so it can
+    detect that retrieval is not needed.
     """
+    import re
+    
+    # Check for contextual follow-up patterns
+    contextual_patterns = [
+        r'\[\d+\]',           # [1], [2], etc.
+        r'\bfirst\s+paper\b',  # "first paper"
+        r'\bsecond\s+paper\b', # "second paper"
+        r'\blast\s+paper\b',   # "last paper"
+        r'\bpaper\s+\d+\b',   # "paper 1", "paper 2"
+        r'\bthose\s+papers\b', # "those papers"
+        r'\bthese\s+papers\b', # "these papers"
+        r'\bthe\s+papers\b',   # "the papers"
+        r'\bprevious\s+answer\b', # "previous answer"
+        r'\bwhat\s+you\s+(just\s+)?said\b', # "what you said"
+        r'\bclarify\b',       # "clarify"
+        r'\bexplain\s+again\b', # "explain again"
+        r'\bsimpler\s+terms\b', # "simpler terms"
+    ]
+    
+    question_lower = question.lower()
+    for pattern in contextual_patterns:
+        if re.search(pattern, question_lower):
+            # Contextual follow-up - let the planner handle it properly
+            return False
+    
+    # Check if session has papers and question references them
+    if session_papers and len(session_papers) > 0:
+        # Has context - might be a follow-up, let planner decide
+        return False
+    
     words = question.split()
     if len(words) >= 20:
         return False
+    
     complex_keywords = {"compare", "comparison", "difference", "differences", "versus",
                         "vs", "also", "additionally", "furthermore", "contrast"}
     return not any(w.lower().strip("?,.:") in complex_keywords for w in words)
-
 
 # ---------------------------------------------------------------------------
 # Step execution helpers
