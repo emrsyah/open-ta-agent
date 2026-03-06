@@ -579,13 +579,24 @@ async def stream_dspy_response(
             try:
                 query_result = await query_task
                 pre_generated_query = query_result.search_query
+                # Extract filter fields from query generation, use as fallback if not provided
+                if year_from is None:
+                    year_from = getattr(query_result, 'year_from', None)
+                if year_to is None:
+                    year_to = getattr(query_result, 'year_to', None)
+                if catalog_type is None:
+                    catalog_type = getattr(query_result, 'catalog_type', None)
+                
                 logger.info("[STREAM] Pre-generated query: '%s'", pre_generated_query)
+                if year_from or year_to:
+                    logger.info("[STREAM] Extracted year filters: %s to %s", year_from, year_to)
+                if catalog_type:
+                    logger.info("[STREAM] Extracted catalog_type: %s", catalog_type)
             except asyncio.CancelledError:
                 pre_generated_query = None
             except Exception as _qe:
                 logger.warning("[STREAM] Pre-query generation failed (%s) — will generate during search step", _qe)
                 pre_generated_query = None
-        
         # Collect pre-generated title (parallel task started earlier)
         if title_task:
             try:
@@ -607,17 +618,18 @@ async def stream_dspy_response(
 
         t_plan_start = time.perf_counter()
         use_default = _should_use_default_plan(question)
+        needs_retrieval = True
         if planner and not use_default:
             try:
-                steps = await asyncio.to_thread(
+                needs_retrieval, steps = await asyncio.to_thread(
                     lambda: planner.create_plan(question=question, is_research=is_research, cheap_lm=cheap_lm)
                 )
                 logger.info("[STREAM] Planner LLM call took %.2fs", time.perf_counter() - t_plan_start)
             except Exception as _pe:
                 logger.warning("[STREAM] Planner raised unexpectedly (%s) — using default plan", _pe)
-                steps = default_plan(is_research)
+                needs_retrieval, steps = True, default_plan(is_research)
         else:
-            steps = default_plan(is_research)
+            needs_retrieval, steps = True, default_plan(is_research)
             logger.info("[STREAM] Using default_plan (heuristic skipped planner LLM call)")
 
         yield format_sse(
@@ -764,11 +776,14 @@ async def stream_dspy_response(
         final_answer: str = ""
         final_sources: list = []
         cited_papers: list = []
+        _emitted_thinking_end = False
 
-        async def _generate_tokens():
-            """Inner generator: yields formatted SSE strings for reasoning + answer."""
-            nonlocal final_answer, final_sources, cited_papers, token_count
-            _emitted_thinking_end = False
+        # Emit a keepalive comment before the potentially long LLM call.
+        # NOTE: We inline the streaming logic to avoid nested async generators
+        # which can cause anyio cancel scope issues across task boundaries.
+        yield ": keepalive\n\n"
+        
+        try:
             raw = streaming_program(
                 question=question, context=combined_context, history=history
             )
@@ -801,16 +816,9 @@ async def stream_dspy_response(
                             "sources": final_sources,
                         }
                     )
-
-        # Emit a keepalive comment before the potentially long LLM call.
-        # NOTE: We do NOT wrap _generate_tokens() with _keepalive_wrap() because
-        # DSPy's streamify uses anyio cancel scopes that must stay in the same
-        # asyncio task.  _keepalive_wrap creates separate tasks via ensure_future
-        # which violates that constraint.  Once the LLM starts generating tokens,
-        # they flow fast enough to keep the SSE connection alive.
-        yield ": keepalive\n\n"
-        async for sse_chunk in _generate_tokens():
-            yield sse_chunk
+        except Exception as e:
+            logger.error("[STREAM] Error during token generation: %s", e, exc_info=True)
+            raise
 
         # ------------------------------------------------------------------ #
         # Post-stream: citation audit + history + title (all after done)     #

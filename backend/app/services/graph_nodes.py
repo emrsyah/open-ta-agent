@@ -104,6 +104,10 @@ async def classify_intent(state: RAGGraphState) -> Command[Literal[
 
     # Await query generation
     pre_generated_query = None
+    extracted_year_from = None
+    extracted_year_to = None
+    extracted_catalog_type = None
+    
     if query_task:
         if not is_research:
             query_task.cancel()
@@ -111,7 +115,16 @@ async def classify_intent(state: RAGGraphState) -> Command[Literal[
             try:
                 query_result = await query_task
                 pre_generated_query = query_result.search_query
+                # Extract filter fields if present
+                extracted_year_from = getattr(query_result, 'year_from', None)
+                extracted_year_to = getattr(query_result, 'year_to', None)
+                extracted_catalog_type = getattr(query_result, 'catalog_type', None)
+                
                 logger.info("[LG-NODE] Pre-generated query: '%s'", pre_generated_query)
+                if extracted_year_from or extracted_year_to:
+                    logger.info("[LG-NODE] Extracted year filters: %s to %s", extracted_year_from, extracted_year_to)
+                if extracted_catalog_type:
+                    logger.info("[LG-NODE] Extracted catalog_type: %s", extracted_catalog_type)
             except asyncio.CancelledError:
                 pass
             except Exception as e:
@@ -128,7 +141,13 @@ async def classify_intent(state: RAGGraphState) -> Command[Literal[
 
     if is_research:
         return Command(
-            update={"is_research": True, "pre_generated_query": pre_generated_query},
+            update={
+                "is_research": True,
+                "pre_generated_query": pre_generated_query,
+                "year_from": extracted_year_from,
+                "year_to": extracted_year_to,
+                "catalog_type": extracted_catalog_type,
+            },
             goto="acknowledge"
         )
     else:
@@ -525,6 +544,8 @@ async def generate_answer_general(state: RAGGraphState) -> dict:
 
     writer({"type": "thinking_start"})
     writer({"type": "answer_start"})
+    
+    logger.info("[LG-NODE-GENERAL] Starting general answer generation for: '%s'", question[:50])
 
     streaming_program = dspy.streamify(
         rag_module,
@@ -533,29 +554,51 @@ async def generate_answer_general(state: RAGGraphState) -> dict:
             dspy.streaming.StreamListener(signature_field_name="answer"),
         ],
     )
+    
+    logger.info("[LG-NODE-GENERAL] DSPy streamify configured with reasoning + answer listeners")
 
     final_answer = ""
     _emitted_thinking_end = False
+    reasoning_token_count = 0
+    answer_token_count = 0
 
     async for value in streaming_program(
         question=question,
         context="No paper context needed for this general query.",
         history=history,
     ):
+        logger.debug("[LG-NODE-GENERAL] Received value type: %s", type(value).__name__)
+        
         if isinstance(value, dspy.streaming.StreamResponse) and value.chunk:
             field = getattr(value, "signature_field_name", "answer")
+            chunk_preview = value.chunk[:30].replace('\n', ' ') if value.chunk else "<empty>"
+            
             if field == "reasoning":
+                reasoning_token_count += 1
+                if reasoning_token_count <= 5 or reasoning_token_count % 20 == 0:
+                    logger.info("[LG-NODE-GENERAL] Reasoning token #%d: '%s...'", reasoning_token_count, chunk_preview)
                 writer({"type": "thinking_token", "content": value.chunk})
             else:
+                answer_token_count += 1
+                if answer_token_count <= 5 or answer_token_count % 20 == 0:
+                    logger.info("[LG-NODE-GENERAL] Answer token #%d (field=%s): '%s...'", answer_token_count, field, chunk_preview)
                 if not _emitted_thinking_end:
+                    logger.info("[LG-NODE-GENERAL] Transitioning to answer phase")
                     writer({"type": "thinking_end"})
                     _emitted_thinking_end = True
                 writer({"type": "token", "content": value.chunk})
         elif isinstance(value, dspy.Prediction):
+            logger.info("[LG-NODE-GENERAL] Prediction received (reasoning: %d, answer: %d tokens)", reasoning_token_count, answer_token_count)
             if not _emitted_thinking_end:
                 writer({"type": "thinking_end"})
+                _emitted_thinking_end = True
             final_answer = getattr(value, "answer", str(value))
             writer({"type": "done", "content": final_answer, "sources": []})
+    
+    logger.info("[LG-NODE-GENERAL] Streaming complete. Total: %d reasoning, %d answer tokens", reasoning_token_count, answer_token_count)
+    
+    if reasoning_token_count == 0:
+        logger.warning("[LG-NODE-GENERAL] NO REASONING TOKENS - Model may not be generating CoT")
 
     return {
         "final_answer": final_answer,
@@ -585,6 +628,8 @@ async def generate_answer(state: RAGGraphState) -> dict:
 
     writer({"type": "answer_start"})
     writer({"type": "thinking_start"})
+    
+    logger.info("[LG-NODE-ANSWER] Starting answer generation for question: '%s'", question[:50])
 
     # Deduplicate papers
     seen_ids: set = set()
@@ -599,6 +644,8 @@ async def generate_answer(state: RAGGraphState) -> dict:
         if all_context_parts
         else "No paper context available for this general question."
     )
+    
+    logger.info("[LG-NODE-ANSWER] Context length: %d chars, Papers: %d", len(combined_context), len(unique_papers))
 
     # Stream CoT reasoning + answer
     streaming_program = dspy.streamify(
@@ -608,29 +655,49 @@ async def generate_answer(state: RAGGraphState) -> dict:
             dspy.streaming.StreamListener(signature_field_name="answer"),
         ],
     )
+    
+    logger.info("[LG-NODE-ANSWER] DSPy streamify configured with listeners: reasoning, answer")
 
     final_answer = ""
     final_sources = []
     cited_papers_list = []
     _emitted_thinking_end = False
+    
+    reasoning_token_count = 0
+    answer_token_count = 0
 
     # Keepalive before potentially long LLM call
     writer({"type": "_keepalive"})
+    
+    logger.info("[LG-NODE-ANSWER] Starting to iterate over streaming program...")
 
     async for value in streaming_program(
         question=question, context=combined_context, history=history
     ):
+        logger.debug("[LG-NODE-ANSWER] Received value type: %s", type(value).__name__)
+        
         if isinstance(value, dspy.streaming.StreamResponse) and value.chunk:
             field = getattr(value, "signature_field_name", "answer")
+            chunk_preview = value.chunk[:30].replace('\n', ' ') if value.chunk else "<empty>"
+            
             if field == "reasoning":
+                reasoning_token_count += 1
+                if reasoning_token_count <= 5 or reasoning_token_count % 20 == 0:
+                    logger.info("[LG-NODE-ANSWER] Reasoning token #%d: '%s...'", reasoning_token_count, chunk_preview)
                 writer({"type": "thinking_token", "content": value.chunk})
             else:
+                answer_token_count += 1
+                if answer_token_count <= 5 or answer_token_count % 20 == 0:
+                    logger.info("[LG-NODE-ANSWER] Answer token #%d (field=%s): '%s...'", answer_token_count, field, chunk_preview)
                 if not _emitted_thinking_end:
+                    logger.info("[LG-NODE-ANSWER] Transitioning from reasoning to answer (emitting thinking_end)")
                     writer({"type": "thinking_end"})
                     _emitted_thinking_end = True
                 writer({"type": "token", "content": value.chunk})
         elif isinstance(value, dspy.Prediction):
+            logger.info("[LG-NODE-ANSWER] Received Prediction object (reasoning tokens: %d, answer tokens: %d)", reasoning_token_count, answer_token_count)
             if not _emitted_thinking_end:
+                logger.info("[LG-NODE-ANSWER] Emitting thinking_end before Prediction")
                 writer({"type": "thinking_end"})
                 _emitted_thinking_end = True
             cited_papers_list = _build_cited_papers(
@@ -643,6 +710,14 @@ async def generate_answer(state: RAGGraphState) -> dict:
                 "content": final_answer,
                 "sources": final_sources,
             })
+    
+    logger.info("[LG-NODE-ANSWER] Streaming complete. Total: %d reasoning tokens, %d answer tokens", reasoning_token_count, answer_token_count)
+    
+    if reasoning_token_count == 0:
+        logger.warning("[LG-NODE-ANSWER] NO REASONING TOKENS RECEIVED! This may indicate:")
+        logger.warning("  1. The LLM doesn't support CoT/reasoning output")
+        logger.warning("  2. The DSPy signature doesn't have a 'reasoning' field")
+        logger.warning("  3. The model isn't generating reasoning before answer")
 
     # Citation audit
     if cited_papers_list or final_answer:

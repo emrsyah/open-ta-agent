@@ -17,14 +17,28 @@ logger = logging.getLogger(__name__)
 
 class QueryGenerationSignature(dspy.Signature):
     """
-    Generate optimal search keywords from user questions.
+    Generate optimal search keywords AND extract filters from user questions.
     
     Convert conversational questions into database-friendly search terms.
     Extract the core concepts and technical keywords that would appear in paper titles and abstracts.
+    Also identify any filtering criteria (years, paper types) mentioned in the query.
+    
+    IMPORTANT: Only extract filters if EXPLICITLY mentioned or clearly implied:
+    - "papers from 2020" → year_from=2020
+    - "recent papers" → year_from=2020 (current year - 5)
+    - "last 3 years" → year_from=2021 (current year - 3)
+    - "S1 thesis" → catalog_type="Karya Ilmiah - Skripsi (S1) - Reference"
+    - "thesis S2" → catalog_type="Karya Ilmiah - Thesis (S2) - Reference"
+    - "journal articles" → catalog_type="Jurnal Internasional - Reference" or "Jurnal Nasional - Reference"
+    
+    If NO time period mentioned → year_from=None, year_to=None
+    If NO paper type mentioned → catalog_type=None
     """
     user_question: str = dspy.InputField(desc="The user's original question in natural language")
-    search_query: str = dspy.OutputField(desc="Optimized search keywords (3-5 key terms) for database lookup")
-
+    search_query: str = dspy.OutputField(desc="Optimized search keywords (3-5 key terms) for database lookup. DO NOT include year ranges or paper types here - put those in the filter fields below.")
+    year_from: Optional[int] = dspy.OutputField(desc="Minimum publication year if mentioned (e.g., 2020, 2021), otherwise None")
+    year_to: Optional[int] = dspy.OutputField(desc="Maximum publication year if mentioned (e.g., 2024, 2025), otherwise None")
+    catalog_type: Optional[str] = dspy.OutputField(desc="Paper type filter if mentioned: 'Karya Ilmiah - Skripsi (S1) - Reference' for S1/skripsi, 'Karya Ilmiah - Thesis (S2) - Reference' for S2/thesis, 'Karya Ilmiah - Disertasi (S3) - Reference' for S3/dissertation, 'Jurnal Internasional - Reference' for international journals, etc. Otherwise None")
 
 class QueryReformulationSignature(dspy.Signature):
     """
@@ -222,17 +236,20 @@ class QueryGenerator(dspy.Module):
     
     def forward(self, user_question: str) -> dspy.Prediction:
         """
-        Generate search keywords from user question.
+        Generate search keywords and extract filters from user question.
         
         Args:
             user_question: The user's natural language question
             
         Returns:
-            Prediction with optimized search_query
+            Prediction with search_query and extracted filter fields (year_from, year_to, catalog_type)
         """
         result = self.generate(user_question=user_question)
         return dspy.Prediction(
             search_query=result.search_query,
+            year_from=getattr(result, 'year_from', None),
+            year_to=getattr(result, 'year_to', None),
+            catalog_type=getattr(result, 'catalog_type', None),
             rationale=getattr(result, 'rationale', None)
         )
 
