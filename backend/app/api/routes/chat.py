@@ -3,7 +3,6 @@ Chat API routes for AI-powered paper Q&A.
 """
 
 import logging
-import mlflow
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -118,64 +117,52 @@ async def chat_basic(
     dspy_history = rag_service._convert_to_dspy_history(raw_history)
 
     if not stream:
-        # For non-streaming, we can wrap the whole operation in an MLflow run
-        with mlflow.start_run(run_name=f"ChatAPI-{conversation_id or 'anon'}"):
-            mlflow.log_params({
-                "conversation_id": conversation_id or "anonymous",
-                "is_incognito": meta_params.is_incognito,
-                "user_id": user_id or "anonymous",
-                "question": query[:100]
-            })
-            
-            result = await rag_service.chat(
-                query,
-                history=raw_history,
-                language=meta_params.language,
-                source_preference=meta_params.source_preference,
-                catalog_type=meta_params.catalog_type,
-                year_from=meta_params.year_from,
-                year_to=meta_params.year_to,
-                author=meta_params.author,
-                has_electronic_access=meta_params.has_electronic_access,
+        result = await rag_service.chat(
+            query,
+            history=raw_history,
+            language=meta_params.language,
+            source_preference=meta_params.source_preference,
+            catalog_type=meta_params.catalog_type,
+            year_from=meta_params.year_from,
+            year_to=meta_params.year_to,
+            author=meta_params.author,
+            has_electronic_access=meta_params.has_electronic_access,
+        )
+        
+        if conversation_id:
+            background_tasks.add_task(
+                _save_history,
+                conversation_id=conversation_id,
+                question=query,
+                answer=result["answer"],
+                sources=[s.model_dump() if hasattr(s, "model_dump") else s for s in result.get("sources", [])],
+                search_query=result.get("search_query"),
+                is_incognito=meta_params.is_incognito,
+                user_id=user_id,
             )
-            
-            if conversation_id:
+            if is_first_message and not meta_params.is_incognito:
                 background_tasks.add_task(
-                    _save_history,
+                    _generate_and_save_title_bg,
                     conversation_id=conversation_id,
                     question=query,
                     answer=result["answer"],
-                    sources=[s.model_dump() if hasattr(s, "model_dump") else s for s in result.get("sources", [])],
-                    search_query=result.get("search_query"),
-                    is_incognito=meta_params.is_incognito,
                     user_id=user_id,
                 )
-                if is_first_message and not meta_params.is_incognito:
-                    background_tasks.add_task(
-                        _generate_and_save_title_bg,
-                        conversation_id=conversation_id,
-                        question=query,
-                        answer=result["answer"],
-                        user_id=user_id,
-                    )
-            # Citation audit on non-streaming path (pure Python, no LLM)
-            raw_sources = result.get("sources", [])
-            audit_data = _audit_citations(result["answer"], raw_sources)
-            citation_audit = CitationAudit(**audit_data)
+        # Citation audit on non-streaming path (pure Python, no LLM)
+        raw_sources = result.get("sources", [])
+        audit_data = _audit_citations(result["answer"], raw_sources)
+        citation_audit = CitationAudit(**audit_data)
 
-            return ChatResponse(
-                answer=result["answer"],
-                sources=raw_sources,
-                context=result.get("rationale"),
-                search_query=result.get("search_query"),
-                citation_audit=citation_audit,
-            )
-
+        return ChatResponse(
+            answer=result["answer"],
+            sources=raw_sources,
+            context=result.get("rationale"),
+            search_query=result.get("search_query"),
+            citation_audit=citation_audit,
+        )
     # ------------------------------------------------------------------ #
     # Streaming path                                                       #
     # ------------------------------------------------------------------ #
-    # Note: MLflow start_run doesn't play well with async generators in every environment,
-    # but autologging within the generator will still capture DSPy traces.
     
     async def _on_complete(answer: str, sources: list, search_query: str | None) -> None:
         if conversation_id:

@@ -87,9 +87,6 @@ class Settings(BaseSettings):
     # Redis
     REDIS_URL: str = "redis://localhost:6379"
 
-    # MLflow Tracing
-    MLFLOW_TRACKING_URI: str = "http://localhost:5000"
-    MLFLOW_EXPERIMENT: str = "OpenTA-DSPy-Tracing"
 
     # Langfuse Observability
     LANGFUSE_SECRET_KEY: Optional[str] = None

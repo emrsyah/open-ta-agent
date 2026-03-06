@@ -8,7 +8,6 @@ import logging
 import os
 
 import dspy
-import mlflow
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -62,20 +61,6 @@ async def lifespan(app: FastAPI):
         )
 
     dspy.configure(lm=main_lm, async_max_workers=settings.DSPY_MAX_WORKERS)
-
-    # Configure MLflow Tracing for DSPy
-    try:
-        mlflow.set_tracking_uri(settings.MLFLOW_TRACKING_URI)
-        mlflow.set_experiment(settings.MLFLOW_EXPERIMENT)
-        # Enable autologging for DSPy
-        mlflow.dspy.autolog(
-            log_compiles=True,
-            log_evals=True,
-            log_traces_from_compile=True
-        )
-        logger.info("MLflow Tracing initialized at %s", settings.MLFLOW_TRACKING_URI)
-    except Exception as e:
-        logger.warning("Failed to initialize MLflow Tracing: %s", e)
 
     # Configure Langfuse via LiteLLM OTEL callback (Langfuse v3 compatible)
     # All DSPy → LiteLLM calls will auto-report to Langfuse
