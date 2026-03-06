@@ -79,17 +79,12 @@ async def get_current_user(
         logger.debug("[AUTH] Successfully verified token for user: %s", user_id)
         return user_id
         
-    except jwt.ExpiredSignatureError:
-        logger.warning("[AUTH] Token expired")
+    except JWTError as e:
+        # Handle all JWT errors: expired, invalid signature, malformed, etc.
+        logger.warning("[AUTH] JWT validation failed: %s", str(e))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token expired"
-        )
-    except jwt.InvalidTokenError as e:
-        logger.warning("[AUTH] Invalid token: %s", str(e))
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token"
+            detail="Invalid or expired token"
         )
     except Exception as e:
         logger.error("[AUTH] Unexpected error during token verification: %s", e)
