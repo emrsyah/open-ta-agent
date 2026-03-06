@@ -1,0 +1,379 @@
+# OpenTA AI Agent Flow Analysis — `/chat/basic` Endpoint
+
+> [!NOTE]
+> This analysis covers the **basic mode** flow from the moment a user sends a message to the final streamed (or non-streaming) response. The codebase uses **DSPy** as the LLM orchestration framework.
+
+---
+
+## High-Level Architecture
+
+```mermaid
+graph TB
+    User["🧑 User (Frontend)"]
+    API["POST /chat/basic"]
+    Auth["JWT Auth Guard"]
+    History["Session Manager (Redis → DB)"]
+    RAG["RAGService"]
+    Stream["stream_dspy_response()"]
+
+    User -->|ChatRequest| API
+    API --> Auth
+    Auth --> API
+    API --> History
+    History -->|raw_history| API
+
+    API -->|stream=false| RAG
+    API -->|stream=true| Stream
+
+    RAG -->|ChatResponse JSON| User
+    Stream -->|SSE event stream| User
+```
+
+---
+
+## Entry Point: [chat.py](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/api/routes/chat.py)
+
+The `POST /chat/basic` endpoint in [chat_basic()](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/api/routes/chat.py#L83-L205) does the following:
+
+1. **Extract params** — [query](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/core/models.py#137-140), [stream](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/core/models.py#141-146), [conversation_id](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/core/models.py#147-150), `user_id`, `meta_params`
+2. **Load history** — via [_load_history()](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/api/routes/chat.py#22-34) (Redis first, DB fallback), capped at last **5 turns**
+3. **Convert history** — `rag_service._convert_to_dspy_history(raw_history)` → `dspy.History`
+4. **Branch** on [stream](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/core/models.py#141-146) flag:
+   - `stream=false` → calls `rag_service.chat()` (non-streaming path)
+   - `stream=true` → returns `StreamingResponse(stream_dspy_response(...))` (SSE path)
+
+---
+
+## Path A: Non-Streaming Flow (`stream=false`)
+
+Handled entirely by [RAGService.chat()](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#L402-L550).
+
+```mermaid
+sequenceDiagram
+    participant FE as Frontend
+    participant API as /chat/basic
+    participant RAG as RAGService.chat()
+    participant IC as IntentClassifier (cheap LM)
+    participant QG as QueryGenerator (cheap LM)
+    participant RET as PaperRetriever (Voyage AI + PGVector)
+    participant QR as QueryReformulator
+    participant PM as PaperRAG (ChainOfThought)
+    participant GD as GapDetector
+
+    FE->>API: POST {query, stream: false}
+    API->>RAG: chat(question, history)
+
+    Note over RAG: Step 0 — Classify Intent
+    RAG->>IC: question → "research" | "general"
+    IC-->>RAG: category
+
+    alt General question
+        RAG->>PM: question + "No paper context" + history
+        PM-->>RAG: answer (no sources)
+        RAG-->>API: {answer, sources: []}
+    end
+
+    Note over RAG: Step 1 — Generate Search Query
+    RAG->>QG: user_question → search keywords
+    QG-->>RAG: search_query
+
+    Note over RAG: Step 2 — Retrieve Papers
+    RAG->>RET: search_query → vector search (Voyage AI embeddings + PGVector)
+    RET-->>RAG: context + papers
+
+    alt Zero results
+        RAG->>QR: reformulate query (broader keywords)
+        QR-->>RAG: broader_query
+        RAG->>RET: retry with broader_query
+        RET-->>RAG: context + papers
+    end
+
+    Note over RAG: Step 3 — Generate Answer
+    RAG->>PM: question + context + history (ChainOfThought)
+    PM-->>RAG: answer + sources + reasoning
+
+    Note over RAG: Step 4 — Gap Detection (Adaptive Re-Retrieval)
+    RAG->>GD: question + answer → "complete" | "partial"
+    alt Partial — gap detected
+        GD-->>RAG: gap_query
+        RAG->>RET: gap_query → extra papers
+        RAG->>PM: re-generate with enriched context
+        PM-->>RAG: refined answer + refined sources
+    end
+
+    RAG-->>API: {answer, sources, rationale, search_query}
+    API-->>FE: ChatResponse JSON
+```
+
+### Non-Streaming Step Breakdown
+
+| Step | Component | Model Used | Purpose |
+|------|-----------|-----------|---------|
+| 0 | [IntentClassifier](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#169-177) | cheap LM (if set) | Route: "research" vs "general" |
+| 1 | [QueryGenerator](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#189-216) | cheap LM (if set) | Convert question → optimized search keywords |
+| 2 | [PaperRetriever](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/retriever.py#14-231) | Voyage AI (embeddings) | Vector similarity search in PGVector |
+| 2b | [QueryReformulator](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#218-228) | cheap LM (if set) | Retry with broader keywords on zero results |
+| 3 | [PaperRAG](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#241-288) (ChainOfThought) | **main LM** | Generate answer with citations |
+| 4 | [GapDetector](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#230-239) | cheap LM (if set) | Check answer completeness, re-retrieve if partial |
+
+### Post-Response (Background Tasks)
+- **Save history** → [_save_history()](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/api/routes/chat.py#36-62) (Redis + DB)
+- **Generate title** (first message only) → [_generate_and_save_title_bg()](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/api/routes/chat.py#208-217) using [TitleGenerationSignature](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#105-115)
+- **Citation audit** → [_audit_citations()](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/utils/streaming.py#67-84) (pure Python regex check, no LLM)
+
+---
+
+## Path B: Streaming Flow (`stream=true`)
+
+Handled by [stream_dspy_response()](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/utils/streaming.py#L299-L806) — a Manus-like planning + execution UX.
+
+```mermaid
+sequenceDiagram
+    participant FE as Frontend (SSE)
+    participant S as stream_dspy_response()
+    participant IC as IntentClassifier
+    participant QG as QueryGenerator
+    participant AG as AcknowledgmentGenerator
+    participant PL as ResearchPlanner
+    participant QD as QueryDecomposer
+    participant RET as PaperRetriever
+    participant QR as QueryReformulator
+    participant DSPy as PaperRAG (streamify)
+    participant GD as GapDetector
+
+    Note over S: Phase 1 — Classify + Pre-generate Query (PARALLEL)
+    S-->>FE: SSE: simple_thinking
+    S-->>FE: SSE: status/classifying
+    par Parallel Execution
+        S->>IC: classify intent
+        S->>QG: generate search query
+    end
+    IC-->>S: "research" | "general"
+    S-->>FE: SSE: status/classified
+
+    alt Research question
+        S->>AG: generate acknowledgment
+        AG-->>S: brief context-aware acknowledgment
+        S-->>FE: SSE: acknowledgment
+    end
+
+    alt General question
+        Note over S: Skip planning, stream answer directly
+        S->>DSPy: streamify(reasoning + answer)
+        loop Token stream
+            DSPy-->>S: reasoning tokens
+            S-->>FE: SSE: thinking_token
+            DSPy-->>S: answer tokens
+            S-->>FE: SSE: token
+        end
+        DSPy-->>S: final Prediction
+        S-->>FE: SSE: done {answer, sources:[]}
+        S-->>FE: SSE: [DONE]
+    end
+
+    Note over S: Phase 2 — Planning (Research Questions)
+    QG-->>S: pre_generated_query
+    S-->>FE: SSE: status/planning
+
+    alt Complex question (≥20 words or comparison keywords)
+        S->>PL: create_plan(question, is_research) — uses MAIN LM
+    else Simple question
+        S->>S: default_plan() — skip planner LLM call
+    end
+    PL-->>S: List[SmartPlanStep]
+    S-->>FE: SSE: plan {steps}
+
+    Note over S: Phase 3 — Execute Steps
+    loop For each plan step
+        S-->>FE: SSE: step_start
+
+        alt Step needs search (research/comparison/analysis)
+            alt multi_query strategy
+                S->>QD: decompose into 2-4 sub-queries
+                S->>RET: parallel_retrieve (all sub-queries concurrently)
+            else single strategy
+                S->>QG: generate query (or use pre-generated)
+                S->>RET: get_papers_with_context
+                alt Zero results
+                    S->>QR: reformulate query
+                    S->>RET: retry with broader query
+                end
+            end
+            S-->>FE: SSE: step_action {search, query}
+            S-->>FE: SSE: step_action_result {paper_count}
+        end
+
+        S->>PL: step_thinker (stream thinking for this step)
+        loop Thinking tokens
+            PL-->>S: thinking chunk
+            S-->>FE: SSE: step_thinking {step_id, content}
+        end
+        S-->>FE: SSE: step_done
+    end
+
+    Note over S: Phase 4 — Stream Final Answer (CoT + Answer)
+    S-->>FE: SSE: answer_start
+    S-->>FE: SSE: thinking_start
+    S->>DSPy: streamify(reasoning + answer) with combined context
+
+    loop CoT Reasoning tokens
+        DSPy-->>S: reasoning chunk
+        S-->>FE: SSE: thinking_token
+    end
+    S-->>FE: SSE: thinking_end
+
+    loop Answer tokens
+        DSPy-->>S: answer chunk
+        S-->>FE: SSE: token
+    end
+    DSPy-->>S: final Prediction
+    S-->>FE: SSE: done {answer, sources}
+
+    Note over S: Phase 5 — Post-Stream
+    S->>S: citation audit (pure Python)
+    S-->>FE: SSE: citation_audit
+
+    alt Gap detected
+        S->>GD: check completeness
+        GD-->>S: partial + gap_query
+        S-->>FE: SSE: refinement_start
+        S->>RET: retrieve additional papers
+        S->>DSPy: re-generate with enriched context
+        loop Refinement tokens
+            S-->>FE: SSE: refinement_token
+        end
+        S-->>FE: SSE: refinement_done
+    end
+
+    S-->>FE: SSE: title (if first message)
+    S-->>FE: SSE: [DONE]
+```
+
+---
+
+## SSE Event Contract
+
+The streaming path emits events in the following order:
+
+| Event Type | Payload | When |
+|-----------|---------|------|
+| `simple_thinking` | `{message}` | Immediately — shimmer in UI |
+| `status` | `{step, message}` | Classification progress |
+| `acknowledgment` | `{content}` | Research questions only — brief ack |
+| [plan](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/planner.py#107-148) | `{steps[]}` | After planning phase |
+| `step_start` | `{step_id, title, description}` | Each step begins |
+| `step_action` | `{step_id, action, query}` | Search/query actions |
+| `step_action_result` | `{step_id, action, paper_count}` | Search results |
+| [step_thinking](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/utils/streaming.py#259-293) | `{step_id, content}` | Streamed thinking tokens per step |
+| `step_done` | `{step_id}` | Step completed |
+| `answer_start` | `{}` | Answer generation begins |
+| `thinking_start` | `{}` | CoT reasoning begins |
+| `thinking_token` | `{content}` | Streamed CoT reasoning tokens |
+| `thinking_end` | `{}` | CoT reasoning finished |
+| [token](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/utils/streaming.py#655-691) | `{content}` | Streamed answer tokens |
+| `done` | `{content, sources[]}` | Complete answer + cited sources |
+| `citation_audit` | `{is_clean, hallucinated_citation_numbers, ...}` | Post-answer |
+| `refinement_start` | `{gap_query}` | If gaps detected |
+| [refinement_token](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/utils/streaming.py#756-771) | `{content}` | Streamed refinement tokens |
+| `refinement_done` | `{content, sources[]}` | Refined answer |
+| [title](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/api/routes/chat.py#64-81) | `{content}` | Auto-generated title (first message) |
+| `[DONE]` | — | Stream end signal |
+
+---
+
+## Key DSPy Modules & Signatures
+
+```mermaid
+graph LR
+    subgraph "Cheap LM (cost-saving)"
+        IC["IntentClassifier<br/>(IntentClassificationSignature)"]
+        QG["QueryGenerator<br/>(QueryGenerationSignature)"]
+        QR["QueryReformulator<br/>(QueryReformulationSignature)"]
+        AG["AcknowledgmentGenerator<br/>(AcknowledgmentSignature)"]
+        GD["GapDetector<br/>(GapDetectionSignature)"]
+        QD["QueryDecomposer<br/>(QueryDecompositionSignature)"]
+    end
+
+    subgraph "Main LM (quality-critical)"
+        PL["ResearchPlanner<br/>(ResearchPlanSignature)"]
+        RAG["PaperRAG (ChainOfThought)<br/>(PaperChatSignature)"]
+        TG["TitleGenerator<br/>(TitleGenerationSignature)"]
+    end
+
+    subgraph "Non-LLM"
+        RET["PaperRetriever<br/>(Voyage AI + PGVector)"]
+        CA["Citation Audit<br/>(pure Python regex)"]
+        PR["parallel_retrieve()"]
+    end
+```
+
+| Module | Signature | Model | Purpose |
+|--------|-----------|-------|---------|
+| [IntentClassifier](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#169-177) | [IntentClassificationSignature](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#117-128) | cheap LM | Route "research" vs "general" |
+| [QueryGenerator](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#189-216) | [QueryGenerationSignature](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#19-28) | cheap LM | Natural language → search keywords |
+| [QueryReformulator](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#218-228) | [QueryReformulationSignature](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#30-38) | cheap LM | Broaden failed queries |
+| [QueryDecomposer](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/query_decomposer.py#42-79) | [QueryDecompositionSignature](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/query_decomposer.py#13-40) | cheap LM | Split complex query into 2-4 sub-queries |
+| [AcknowledgmentGenerator](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#179-187) | [AcknowledgmentSignature](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#145-167) | cheap LM | Quick ack before research |
+| [GapDetector](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#230-239) | [GapDetectionSignature](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#130-143) | cheap LM | Detect missing aspects in answer |
+| [ResearchPlanner](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/planner.py#101-148) | [ResearchPlanSignature](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/planner.py#44-79) | **main LM** | Create 2-3 step research plan |
+| [PaperRAG](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#241-288) | [PaperChatSignature](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#41-103) (ChainOfThought) | **main LM** | Generate cited answer |
+| `TitleGenerator` | [TitleGenerationSignature](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#105-115) | cheap LM | Auto-generate conversation title |
+
+---
+
+## Smart Planning System
+
+The [ResearchPlanner](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/planner.py) produces [SmartPlanStep](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/planner.py#20-38) objects with:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `step_type` | `research \| synthesis \| comparison \| analysis` | Determines if search is needed |
+| `query_strategy` | `single \| multi_query` | Single retrieval vs parallel decomposition |
+| `decomposition_hint` | `str \| None` | Hint for QueryDecomposer (e.g., `"methods:SVM,CNN,BERT"`) |
+| `focus_area` | `str \| None` | Specific aspect to focus on |
+
+**Heuristic skip**: Simple questions (< 20 words, no comparison keywords) use [default_plan()](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/planner.py#150-178) to skip the planner LLM call entirely.
+
+---
+
+## Retrieval Layer
+
+### Single-Query Path
+1. **Query generation** → [QueryGenerator](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#189-216) → optimized keywords
+2. **Vector search** → Voyage AI embeds query → PGVector cosine similarity → top-k papers
+3. **Zero-result retry** → [QueryReformulator](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#218-228) → broader query → retry search
+
+### Multi-Query Path (for `query_strategy='multi_query'`)
+1. **Decomposition** → [QueryDecomposer](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/query_decomposer.py#42-79) → 2-4 sub-queries
+2. **Parallel retrieval** → [parallel_retrieve()](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/utils/parallel_retrieve.py) runs all sub-queries concurrently
+3. **Deduplication** → merge results across sub-queries
+
+---
+
+## Post-Processing Pipeline
+
+1. **Citation building** — [_build_cited_papers()](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/utils/streaming.py#33-56) maps DSPy-returned source IDs back to retrieved [PaperResult](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/core/models.py#36-39) objects → [CitedPaper](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/core/models.py#159-167) with `citation_number`
+2. **Citation audit** — [_audit_citations()](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/utils/streaming.py#67-84) uses regex `\[(\d+)\]` to find all `[N]` references in the answer and flags any N > number of retrieved papers (hallucination detection, zero latency)
+3. **Gap detection** — [GapDetector](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#230-239) checks if the answer fully covers the question; if partial, triggers re-retrieval + re-generation
+4. **History persistence** — [_save_history()](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/api/routes/chat.py#36-62) → Redis + DB via `SessionManager`
+5. **Title generation** — [TitleGenerationSignature](file:///c:/Users/emirsyah/Documents/CODING/openta/open-ta-telyu-dspy/backend/app/services/rag.py#105-115) on first message only (cheap LM)
+
+---
+
+## Summary: LLM Call Count
+
+> [!IMPORTANT]
+> In the worst case (streaming, research question, complex plan, gap detected), the system makes **up to 9+ LLM calls** per user message.
+
+| Call # | What | Model |
+|--------|------|-------|
+| 1 | Intent classification | cheap |
+| 2 | Query generation (parallel with #1) | cheap |
+| 3 | Acknowledgment generation | cheap |
+| 4 | Plan generation | **main** |
+| 5-6 | Step thinking (per step, ~2 steps) | cheap |
+| 7 | Query decomposition (if multi_query) | cheap |
+| 8 | Final answer (ChainOfThought) | **main** |
+| 9 | Gap detection | cheap |
+| 10 | Refinement answer (if gap found) | **main** |
+| 11 | Title generation (first message) | cheap |

@@ -87,6 +87,13 @@ class Settings(BaseSettings):
     # Redis
     REDIS_URL: str = "redis://localhost:6379"
 
+
+    # Langfuse Observability
+    LANGFUSE_SECRET_KEY: Optional[str] = None
+    LANGFUSE_PUBLIC_KEY: Optional[str] = None
+    LANGFUSE_BASE_URL: str = "https://cloud.langfuse.com"
+    LANGFUSE_ENABLED: bool = True
+
     # Database Pool Settings
     DB_POOL_SIZE: int = 5
     DB_MAX_OVERFLOW: int = 10

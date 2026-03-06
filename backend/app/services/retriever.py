@@ -150,19 +150,44 @@ class PaperRetriever:
                 matches.append(paper)
         return matches[:limit]
     
-    async def get_papers_with_context(self, query: str, top_k: int = 3) -> tuple[str, List[PaperResult]]:
+    async def get_papers_with_context(
+        self,
+        query: str,
+        top_k: int = 5,
+        paper_offset: int = 0,
+        catalog_type: Optional[str] = None,
+        year_from: Optional[int] = None,
+        year_to: Optional[int] = None,
+        author: Optional[str] = None,
+        has_electronic_access: Optional[bool] = None,
+    ) -> tuple[str, List[PaperResult]]:
         """
         Retrieve papers and return both the formatted context string and the paper objects.
         Use this instead of get_context() so callers can enrich sources without extra DB calls.
+
+        Args:
+            paper_offset: Starting number for Paper N labels (for multi-step global numbering).
+                          e.g. pass len(already_retrieved_papers) so step 2 starts at Paper 4.
+            catalog_type: Filter by catalog type (e.g., 'Skripsi', 'Thesis').
+            year_from: Minimum publication year.
+            year_to: Maximum publication year.
+            author: Filter by author name (partial match).
+            has_electronic_access: If True, only return papers with electronic access.
         """
         logger.info(f"[RETRIEVER] Context retrieval for: '{query}'")
-        papers = await self.search(query, limit=top_k)
+        papers = await self.search(
+            query, 
+            limit=top_k,
+            catalog_type=catalog_type,
+            year_from=year_from,
+            year_to=year_to,
+        )
 
         if not papers:
             return "No relevant papers found in the catalog.", []
 
         context_parts = []
-        for i, paper in enumerate(papers, 1):
+        for i, paper in enumerate(papers, start=paper_offset + 1):
             context_parts.append(
                 f"Paper {i} (ID: {paper.id})\n"
                 f"Title: {paper.title}\n"

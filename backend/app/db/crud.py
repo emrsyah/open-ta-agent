@@ -5,7 +5,7 @@ CRUD operations for Catalog model.
 import logging
 from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_, and_, text, case
+from sqlalchemy import select, func, or_, and_, text, case, cast
 from sqlalchemy.orm import selectinload
 
 from app.db.models import Catalog, CatalogType, Conversation, Message
@@ -144,11 +144,16 @@ class CatalogCRUD:
         filters = []
         if catalog_type:
             try:
-                # Handle both string and enum if possible
-                filters.append(Catalog.catalog_type == catalog_type)
-            except Exception:
-                pass
-        
+                # Convert string to CatalogType enum value
+                cat_type_enum = CatalogType(catalog_type)
+                # Use explicit PostgreSQL cast: 'value'::catalog_type
+                # Since SQLAlchemy doesn't know about the enum type, use raw SQL
+                filters.append(
+                    text(f"catalog.catalog_type = '{cat_type_enum.value}'::catalog_type")
+                )
+            except ValueError:
+                # If conversion fails, skip the filter
+                logger.warning(f"[CRUD] Invalid catalog_type: {catalog_type}")
         if year_from is not None:
             filters.append(Catalog.publication_year >= year_from)
         
@@ -215,8 +220,17 @@ class CatalogCRUD:
         filters = []
         
         if catalog_type:
-            filters.append(Catalog.catalog_type == catalog_type)
-        
+            try:
+                # Convert string to CatalogType enum value
+                cat_type_enum = CatalogType(catalog_type)
+                # Use explicit PostgreSQL cast: 'value'::catalog_type
+                # Since SQLAlchemy doesn't know about the enum type, use raw SQL
+                filters.append(
+                    text(f"catalog.catalog_type = '{cat_type_enum.value}'::catalog_type")
+                )
+            except ValueError:
+                # If conversion fails, skip the filter
+                logger.warning(f"[CRUD] Invalid catalog_type: {catalog_type}")
         if year_from is not None:
             filters.append(Catalog.publication_year >= year_from)
         

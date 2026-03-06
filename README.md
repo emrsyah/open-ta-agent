@@ -65,6 +65,7 @@ python main.py
 
 Open `frontend/index.html` in your browser (or use Live Server extension).
 
+
 ---
 
 ## 🎯 Features

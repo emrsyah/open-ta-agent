@@ -212,11 +212,6 @@ async def _execute_search_step(
     query_reformulator: Any = None,
     query_decomposer: QueryDecomposer | None = None,
     paper_offset: int = 0,
-    catalog_type: str | None = None,
-    year_from: int | None = None,
-    year_to: int | None = None,
-    author: str | None = None,
-    has_electronic_access: bool | None = None,
 ) -> tuple[str, list, str, str | None]:
     """
     Runs query generation + retrieval for a search step.
@@ -232,8 +227,6 @@ async def _execute_search_step(
     - original_query_if_reformulated is non-None only when reformulation occurred.
     - paper_offset: number of papers already retrieved in previous steps, used to
       produce globally unique Paper N labels in the context string.
-    - Filter params (catalog_type, year_from, year_to, author, has_electronic_access):
-      applied to all retrieval calls to narrow down results.
     """
     # Check if this step uses multi-query strategy
     use_multi_query = getattr(step, 'query_strategy', 'single') == 'multi_query'
@@ -281,15 +274,7 @@ async def _execute_search_step(
     else:
         search_query = question
 
-    context, papers = await retriever.get_papers_with_context(
-        search_query,
-        paper_offset=paper_offset,
-        catalog_type=catalog_type,
-        year_from=year_from,
-        year_to=year_to,
-        author=author,
-        has_electronic_access=has_electronic_access,
-    )
+    context, papers = await retriever.get_papers_with_context(search_query, paper_offset=paper_offset)
 
     # Zero-result retry: reformulate and try once more
     if len(papers) == 0 and query_reformulator:
@@ -300,13 +285,7 @@ async def _execute_search_step(
         broader_query = reformulation.broader_query.strip()
         if broader_query and broader_query != search_query:
             context, papers = await retriever.get_papers_with_context(
-                broader_query,
-                paper_offset=paper_offset,
-                catalog_type=catalog_type,
-                year_from=year_from,
-                year_to=year_to,
-                author=author,
-                has_electronic_access=has_electronic_access,
+                broader_query, paper_offset=paper_offset
             )
             return broader_query, papers, context, original_query
 
@@ -328,36 +307,26 @@ async def _stream_step_thinking(
         ],
     )
 
-    # Collect all chunks first to avoid cross-task cancel scope issues
-    chunks = []
     ctx = dspy.context(lm=cheap_lm) if cheap_lm else contextlib.nullcontext()
-    try:
-        with ctx:
-            async for value in streaming_thinker(
-                question=question,
-                step_title=step.title,
-                step_description=step.description,
-                gathered_context=gathered_context,
+    with ctx:
+        async for value in streaming_thinker(
+            question=question,
+            step_title=step.title,
+            step_description=step.description,
+            gathered_context=gathered_context,
+        ):
+            if (
+                isinstance(value, dspy.streaming.StreamResponse)
+                and value.chunk
             ):
-                if (
-                    isinstance(value, dspy.streaming.StreamResponse)
-                    and value.chunk
-                ):
-                    chunks.append(value.chunk)
-    except Exception as e:
-        logger.warning(f"[STREAM] Step thinking error: {e}")
-        # Continue without thinking if it fails
-        return
+                yield format_sse(
+                    {
+                        "type": "step_thinking",
+                        "step_id": step.id,
+                        "content": value.chunk,
+                    }
+                )
 
-    # Yield collected chunks
-    for chunk in chunks:
-        yield format_sse(
-            {
-                "type": "step_thinking",
-                "step_id": step.id,
-                "content": chunk,
-            }
-        )
 
 # ---------------------------------------------------------------------------
 # Main streaming entry point
@@ -383,12 +352,7 @@ async def stream_dspy_response(
     gap_detector: Any = None,
     title_from_question_generator: Any = None,
     save_title_callback: Any = None,
-    catalog_type: str | None = None,
-    year_from: int | None = None,
-    year_to: int | None = None,
-    author: str | None = None,
-    has_electronic_access: bool | None = None,
-    ) -> AsyncGenerator[str, None]:
+) -> AsyncGenerator[str, None]:
     """
     Stream a planning-first agent response as SSE events.
     
@@ -415,6 +379,7 @@ async def stream_dspy_response(
       title         { content }            ← now non-blocking!
       error         { content }
     """
+    start_time = time.time()
     start_time = time.time()
     token_count = 0
 
@@ -462,6 +427,9 @@ async def stream_dspy_response(
         is_research = True
         pre_generated_query: str | None = None
         pre_generated_title: str | None = None  # Will store title once ready
+        is_research = True
+        pre_generated_query: str | None = None
+
         if intent_task:
             try:
                 intent_res = await intent_task
@@ -555,9 +523,6 @@ async def stream_dspy_response(
                             title = getattr(title_result, 'title', None)
                             if title:
                                 yield format_sse({"type": "title", "content": title})
-                                # Save to DB (fire-and-forget)
-                                if save_title_callback:
-                                    asyncio.create_task(save_title_callback(title))
                         except Exception as _te:
                             logger.warning("[STREAM] Pre-title collection error: %s", _te)
                     elif generate_title:
@@ -579,24 +544,13 @@ async def stream_dspy_response(
             try:
                 query_result = await query_task
                 pre_generated_query = query_result.search_query
-                # Extract filter fields from query generation, use as fallback if not provided
-                if year_from is None:
-                    year_from = getattr(query_result, 'year_from', None)
-                if year_to is None:
-                    year_to = getattr(query_result, 'year_to', None)
-                if catalog_type is None:
-                    catalog_type = getattr(query_result, 'catalog_type', None)
-                
                 logger.info("[STREAM] Pre-generated query: '%s'", pre_generated_query)
-                if year_from or year_to:
-                    logger.info("[STREAM] Extracted year filters: %s to %s", year_from, year_to)
-                if catalog_type:
-                    logger.info("[STREAM] Extracted catalog_type: %s", catalog_type)
             except asyncio.CancelledError:
                 pre_generated_query = None
             except Exception as _qe:
                 logger.warning("[STREAM] Pre-query generation failed (%s) — will generate during search step", _qe)
                 pre_generated_query = None
+        
         # Collect pre-generated title (parallel task started earlier)
         if title_task:
             try:
@@ -604,9 +558,6 @@ async def stream_dspy_response(
                 pre_generated_title = getattr(title_result, 'title', None)
                 if pre_generated_title:
                     logger.info("[STREAM] Pre-generated title: '%s'", pre_generated_title)
-                    # Save title to DB immediately (non-blocking via fire-and-forget)
-                    if save_title_callback:
-                        asyncio.create_task(save_title_callback(pre_generated_title))
             except asyncio.CancelledError:
                 pre_generated_title = None
             except Exception as _te:
@@ -618,18 +569,17 @@ async def stream_dspy_response(
 
         t_plan_start = time.perf_counter()
         use_default = _should_use_default_plan(question)
-        needs_retrieval = True
         if planner and not use_default:
             try:
-                needs_retrieval, steps = await asyncio.to_thread(
+                steps = await asyncio.to_thread(
                     lambda: planner.create_plan(question=question, is_research=is_research, cheap_lm=cheap_lm)
                 )
                 logger.info("[STREAM] Planner LLM call took %.2fs", time.perf_counter() - t_plan_start)
             except Exception as _pe:
                 logger.warning("[STREAM] Planner raised unexpectedly (%s) — using default plan", _pe)
-                needs_retrieval, steps = True, default_plan(is_research)
+                steps = default_plan(is_research)
         else:
-            needs_retrieval, steps = True, default_plan(is_research)
+            steps = default_plan(is_research)
             logger.info("[STREAM] Using default_plan (heuristic skipped planner LLM call)")
 
         yield format_sse(
@@ -776,14 +726,11 @@ async def stream_dspy_response(
         final_answer: str = ""
         final_sources: list = []
         cited_papers: list = []
-        _emitted_thinking_end = False
 
-        # Emit a keepalive comment before the potentially long LLM call.
-        # NOTE: We inline the streaming logic to avoid nested async generators
-        # which can cause anyio cancel scope issues across task boundaries.
-        yield ": keepalive\n\n"
-        
-        try:
+        async def _generate_tokens():
+            """Inner generator: yields formatted SSE strings for reasoning + answer."""
+            nonlocal final_answer, final_sources, cited_papers, token_count
+            _emitted_thinking_end = False
             raw = streaming_program(
                 question=question, context=combined_context, history=history
             )
@@ -816,9 +763,16 @@ async def stream_dspy_response(
                             "sources": final_sources,
                         }
                     )
-        except Exception as e:
-            logger.error("[STREAM] Error during token generation: %s", e, exc_info=True)
-            raise
+
+        # Emit a keepalive comment before the potentially long LLM call.
+        # NOTE: We do NOT wrap _generate_tokens() with _keepalive_wrap() because
+        # DSPy's streamify uses anyio cancel scopes that must stay in the same
+        # asyncio task.  _keepalive_wrap creates separate tasks via ensure_future
+        # which violates that constraint.  Once the LLM starts generating tokens,
+        # they flow fast enough to keep the SSE connection alive.
+        yield ": keepalive\n\n"
+        async for sse_chunk in _generate_tokens():
+            yield sse_chunk
 
         # ------------------------------------------------------------------ #
         # Post-stream: citation audit + history + title (all after done)     #
