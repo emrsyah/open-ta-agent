@@ -105,6 +105,27 @@ class ChatMetaParams(BaseModel):
         default=None,
         description="Conversation ID for retrieving history"
     )
+    # Retrieval filters for paper search
+    catalog_type: Optional[str] = Field(
+        default=None,
+        description="Filter by catalog type: 'Skripsi', 'Thesis', 'Disertasi', 'Jurnal Internasional', etc."
+    )
+    year_from: Optional[int] = Field(
+        default=None,
+        description="Minimum publication year (e.g., 2020)"
+    )
+    year_to: Optional[int] = Field(
+        default=None,
+        description="Maximum publication year (e.g., 2024)"
+    )
+    author: Optional[str] = Field(
+        default=None,
+        description="Filter by author name (partial match supported)"
+    )
+    has_electronic_access: Optional[bool] = Field(
+        default=None,
+        description="If true, only return papers with electronic/online access"
+    )
 
 
 

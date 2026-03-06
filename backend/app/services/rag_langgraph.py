@@ -31,6 +31,7 @@ from app.services.rag import (
     GapDetector,
     PaperRAG,
     TitleGenerationSignature,
+    TitleFromQuestionGenerator,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,7 +57,7 @@ class RAGServiceLangGraph:
         self.acknowledgment_generator = AcknowledgmentGenerator()
         self.planner = ResearchPlanner()
         self.gap_detector = GapDetector()
-
+        self.title_from_question_generator = TitleFromQuestionGenerator()
         # Build the LangGraph
         self.graph = build_rag_graph()
 
@@ -92,6 +93,11 @@ class RAGServiceLangGraph:
         on_complete: Any = None,
         generate_title_fn: Any = None,
         is_first_message: bool = False,
+        catalog_type: Optional[str] = None,
+        year_from: Optional[int] = None,
+        year_to: Optional[int] = None,
+        author: Optional[str] = None,
+        has_electronic_access: Optional[bool] = None,
     ) -> RAGGraphState:
         """Build the initial state dict for the LangGraph invocation.
         
@@ -152,6 +158,12 @@ class RAGServiceLangGraph:
             "last_answer": last_answer,
             "last_sources": [],
             "needs_retrieval": True,
+            # Filter fields
+            "catalog_type": catalog_type,
+            "year_from": year_from,
+            "year_to": year_to,
+            "author": author,
+            "has_electronic_access": has_electronic_access,
             # Output
             "final_answer": "",
             "final_sources": [],
@@ -170,6 +182,11 @@ class RAGServiceLangGraph:
         history: Optional[List[dict]] = None,
         language: str = "en-US",
         source_preference: str = "all",
+        catalog_type: Optional[str] = None,
+        year_from: Optional[int] = None,
+        year_to: Optional[int] = None,
+        author: Optional[str] = None,
+        has_electronic_access: Optional[bool] = None,
     ) -> dict:
         """Non-streaming chat (mirrors original RAGService.chat)."""
         state = await self._build_initial_state(
@@ -177,6 +194,11 @@ class RAGServiceLangGraph:
             history=history,
             language=language,
             source_preference=source_preference,
+            catalog_type=catalog_type,
+            year_from=year_from,
+            year_to=year_to,
+            author=author,
+            has_electronic_access=has_electronic_access,
         )
 
         result = await self.graph.ainvoke(state)
@@ -194,6 +216,11 @@ class RAGServiceLangGraph:
         history: Optional[List[dict]] = None,
         language: str = "en-US",
         source_preference: str = "all",
+        catalog_type: Optional[str] = None,
+        year_from: Optional[int] = None,
+        year_to: Optional[int] = None,
+        author: Optional[str] = None,
+        has_electronic_access: Optional[bool] = None,
         conversation_id: Optional[str] = None,
         is_incognito: bool = False,
         user_id: Optional[str] = None,
@@ -213,6 +240,11 @@ class RAGServiceLangGraph:
             history=history,
             language=language,
             source_preference=source_preference,
+            catalog_type=catalog_type,
+            year_from=year_from,
+            year_to=year_to,
+            author=author,
+            has_electronic_access=has_electronic_access,
             conversation_id=conversation_id,
             is_incognito=is_incognito,
             user_id=user_id,

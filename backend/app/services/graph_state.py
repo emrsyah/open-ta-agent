@@ -31,6 +31,13 @@ class RAGGraphState(TypedDict, total=False):
     source_preference: str
     is_incognito: bool
     user_id: Optional[str]
+    
+    # ── Filter fields for retrieval ─────────────────────────────────────
+    catalog_type: Optional[str]
+    year_from: Optional[int]
+    year_to: Optional[int]
+    author: Optional[str]
+    has_electronic_access: Optional[bool]
 
     # ── Injected services (set by the service layer, read-only in nodes) ─
     cheap_lm: Any  # Optional cheap/fast LLM for lightweight calls

@@ -299,7 +299,12 @@ async def execute_step(state: RAGGraphState) -> dict:
                 query_reformulator=query_reformulator,
                 query_decomposer=query_decomposer,
                 paper_offset=len(existing_papers),
-            )
+                catalog_type=state.get("catalog_type"),
+                year_from=state.get("year_from"),
+                year_to=state.get("year_to"),
+                author=state.get("author"),
+                has_electronic_access=state.get("has_electronic_access"),
+)
 
             if original_query is not None:
                 writer({
@@ -718,7 +723,15 @@ async def refine_answer(state: RAGGraphState) -> dict:
 
     # Retrieve additional context for the gap (fall back to original question if empty)
     search_query = gap_query or question
-    extra_context, extra_papers = await retriever.get_papers_with_context(search_query)
+    extra_context, extra_papers = await retriever.get_papers_with_context(
+        search_query,
+        catalog_type=state.get("catalog_type"),
+        year_from=state.get("year_from"),
+        year_to=state.get("year_to"),
+        author=state.get("author"),
+        has_electronic_access=state.get("has_electronic_access"),
+)
+    writer({"type": "refinement_search", "paper_count": len(extra_papers)})
     writer({"type": "refinement_search", "paper_count": len(extra_papers)})
 
     # Merge papers

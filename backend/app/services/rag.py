@@ -114,6 +114,29 @@ class TitleGenerationSignature(dspy.Signature):
     title: str = dspy.OutputField(desc="Concise conversation title, 4-7 words")
 
 
+class TitleFromQuestionSignature(dspy.Signature):
+    """
+    Generate a short, descriptive conversation title from the user's question ONLY.
+    This allows title generation to happen early (parallel with intent classification).
+    
+    The title should capture the core topic in 4-7 words.
+    Do NOT use generic phrases like 'Research on' or 'Question about'.
+    Return only the title text, no quotes or punctuation at the end.
+    """
+    question: str = dspy.InputField(desc="The user's question")
+    title: str = dspy.OutputField(desc="Concise conversation title, 4-7 words")
+
+
+class TitleFromQuestionGenerator(dspy.Module):
+    """Generates conversation title from question only (no answer needed)."""
+    
+    def __init__(self):
+        super().__init__()
+        self.generate = dspy.Predict(TitleFromQuestionSignature)
+    
+    def forward(self, question: str) -> dspy.Prediction:
+        return self.generate(question=question)
+
 class IntentClassificationSignature(dspy.Signature):
     """
     Categorize user input to decide if database research is needed.
@@ -312,8 +335,8 @@ class RAGService:
         self.acknowledgment_generator = AcknowledgmentGenerator()
         self.planner = ResearchPlanner()
         self.gap_detector = GapDetector()
+        self.title_from_question_generator = TitleFromQuestionGenerator()
         self.cheap_lm = cheap_lm
-    
     def _generate_search_query(self, user_question: str) -> str:
         """
         Use LLM to generate optimized search keywords.
@@ -404,7 +427,12 @@ class RAGService:
         question: str, 
         history: Optional[List[dict]] = None,
         language: str = "en-US",
-        source_preference: str = "all"
+        source_preference: str = "all",
+        catalog_type: Optional[str] = None,
+        year_from: Optional[int] = None,
+        year_to: Optional[int] = None,
+        author: Optional[str] = None,
+        has_electronic_access: Optional[bool] = None,
     ) -> dict:
         """
         Get answer for a question with conversation history support (non-streaming).
@@ -414,6 +442,11 @@ class RAGService:
             history: Optional list of previous conversation messages
             language: User's preferred language (e.g., 'id-ID', 'en-US')
             source_preference: Filter for sources ('all', 'only_papers', 'only_general')
+            catalog_type: Filter by document type (e.g., 'Thesis', 'Skripsi')
+            year_from: Minimum publication year
+            year_to: Maximum publication year
+            author: Filter by author name
+            has_electronic_access: Filter for papers with online access
             
         Returns:
             Dict with answer, sources, and optional rationale
@@ -462,7 +495,14 @@ class RAGService:
 
             # Step 2: Retrieve context + papers together (avoids extra DB calls later)
             logger.info(f"[RAG] Retrieving context with query: '{search_query}'")
-            context, retrieved_papers = await self.retriever.get_papers_with_context(search_query)
+            context, retrieved_papers = await self.retriever.get_papers_with_context(
+                search_query,
+                catalog_type=catalog_type,
+                year_from=year_from,
+                year_to=year_to,
+                author=author,
+                has_electronic_access=has_electronic_access,
+            )
             mlflow.log_metric("papers_retrieved", len(retrieved_papers))
 
             # Zero-result retry (Improvement 1)
@@ -479,7 +519,14 @@ class RAGService:
                     logger.info(f"[RAG] Retrying with broader query: '{broader_query}'")
                     search_query = broader_query
                     mlflow.log_param("broader_search_query", search_query)
-                    context, retrieved_papers = await self.retriever.get_papers_with_context(search_query)
+                    context, retrieved_papers = await self.retriever.get_papers_with_context(
+                        search_query,  # Use updated search_query (broader_query)
+                        catalog_type=catalog_type,
+                        year_from=year_from,
+                        year_to=year_to,
+                        author=author,
+                        has_electronic_access=has_electronic_access,
+                    )
                     mlflow.log_metric("papers_retrieved_after_retry", len(retrieved_papers))
 
             logger.info(f"[RAG] Context retrieved (length: {len(context)} chars, {len(retrieved_papers)} papers)")
@@ -515,7 +562,14 @@ class RAGService:
                         logger.info(f"[RAG] Gap detected. Refining with query: '{gap_q}'")
                         mlflow.log_param("gap_query", gap_q)
                         
-                        extra_context, extra_papers = await self.retriever.get_papers_with_context(gap_q)
+                        extra_context, extra_papers = await self.retriever.get_papers_with_context(
+                            gap_q,
+                            catalog_type=catalog_type,
+                            year_from=year_from,
+                            year_to=year_to,
+                            author=author,
+                            has_electronic_access=has_electronic_access,
+                        )
                         
                         if extra_papers:
                             # Combine context and deduplicate papers

@@ -132,6 +132,11 @@ async def chat_basic(
                 history=raw_history,
                 language=meta_params.language,
                 source_preference=meta_params.source_preference,
+                catalog_type=meta_params.catalog_type,
+                year_from=meta_params.year_from,
+                year_to=meta_params.year_to,
+                author=meta_params.author,
+                has_electronic_access=meta_params.has_electronic_access,
             )
             
             if conversation_id:
@@ -191,6 +196,11 @@ async def chat_basic(
             await _save_title(conversation_id, title, user_id)
         return title
 
+    # Callback to save title early (when generated from question only)
+    async def _save_title_callback(title: str) -> None:
+        if conversation_id and not meta_params.is_incognito:
+            await _save_title(conversation_id, title, user_id)
+
     return StreamingResponse(
         stream_dspy_response(
             rag_service.get_module(),
@@ -209,6 +219,13 @@ async def chat_basic(
             query_reformulator=rag_service.query_reformulator,
             query_decomposer=rag_service.query_decomposer,
             gap_detector=rag_service.gap_detector,
+            catalog_type=meta_params.catalog_type,
+            year_from=meta_params.year_from,
+            year_to=meta_params.year_to,
+            author=meta_params.author,
+            has_electronic_access=meta_params.has_electronic_access,
+            title_from_question_generator=rag_service.title_from_question_generator if is_first_message and not meta_params.is_incognito else None,
+            save_title_callback=_save_title_callback if is_first_message and not meta_params.is_incognito else None,
         ),
         media_type="text/event-stream",
         headers={
@@ -217,7 +234,6 @@ async def chat_basic(
             "X-Accel-Buffering": "no",
         },
     )
-
 
 async def _generate_and_save_title_bg(
     conversation_id: str, question: str, answer: str, user_id: str | None = None
@@ -280,6 +296,11 @@ async def chat_new(
             history=raw_history,
             language=meta_params.language,
             source_preference=meta_params.source_preference,
+            catalog_type=meta_params.catalog_type,
+            year_from=meta_params.year_from,
+            year_to=meta_params.year_to,
+            author=meta_params.author,
+            has_electronic_access=meta_params.has_electronic_access,
         )
 
         if conversation_id:
@@ -339,6 +360,11 @@ async def chat_new(
             history=raw_history,
             language=meta_params.language,
             source_preference=meta_params.source_preference,
+            catalog_type=meta_params.catalog_type,
+            year_from=meta_params.year_from,
+            year_to=meta_params.year_to,
+            author=meta_params.author,
+            has_electronic_access=meta_params.has_electronic_access,
             conversation_id=conversation_id,
             is_incognito=meta_params.is_incognito,
             user_id=user_id,
