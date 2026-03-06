@@ -7,14 +7,12 @@ Create migration: alembic revision --autogenerate -m "description"
 import asyncio
 from logging.config import fileConfig
 
-import sqlalchemy as sa
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from alembic import context
 
 from app.config import get_settings
 from app.database import Base
-from app.db.models import Catalog, CatalogType  # noqa: F401 — registers models with metadata
 
 config = context.config
 

@@ -88,7 +88,6 @@ async def chat_basic(
     current_user: str = Depends(get_current_user_required),
 ):
     """Basic AI chat with papers. Supports streaming (SSE) and non-streaming responses."""
-    import dspy
     rag_service = get_rag_service()
     query = request.get_query()
     stream = request.get_stream()
