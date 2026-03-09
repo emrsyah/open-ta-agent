@@ -23,6 +23,9 @@ langchain-core
 deepagents
 langchain-openrouter
 
+# Custom Research Agent (LangChain)
+langchain
+
 # Observability
 langfuse
 

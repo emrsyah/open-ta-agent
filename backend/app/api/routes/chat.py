@@ -81,7 +81,7 @@ async def _save_title(
 
 
 @router.post("/basic", response_model=ChatResponse)
-@observe(name="chat-basic")
+@observe(name="chat-basic", capture_output=False)
 async def chat_basic(
     request: ChatRequest,
     background_tasks: BackgroundTasks,
@@ -237,7 +237,7 @@ async def _generate_and_save_title_bg(
 # ------------------------------------------------------------------ #
 
 @router.post("/new", response_model=ChatResponse)
-@observe(name="chat-new-lg")
+@observe(name="chat-new-lg", capture_output=False)
 async def chat_new(
     request: ChatRequest,
     background_tasks: BackgroundTasks,
@@ -399,7 +399,7 @@ async def chat_deep(request: ChatRequest):
 # ------------------------------------------------------------------ #
 
 @router.post("/deepagents", response_model=ChatResponse)
-@observe(name="chat-deepagents")
+@observe(name="chat-deepagents", capture_output=False)
 async def chat_deepagents(
     request: ChatRequest,
     background_tasks: BackgroundTasks,

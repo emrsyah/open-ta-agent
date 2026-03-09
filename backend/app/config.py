@@ -47,6 +47,12 @@ class Settings(BaseSettings):
     DSPY_MODEL: str = "openrouter/google/gemini-2.5-flash-lite"
     DSPY_FALLBACK_MODEL: str = "openai/gpt-4o-mini"
     
+    # Deep Agents model (needs a more capable model for agentic tool-calling loops)
+    DEEPAGENTS_MODEL: str = "openrouter/google/gemini-2.5-flash"
+
+    # Custom Research Agent model
+    AGENT_MODEL: str = "openrouter/google/gemini-2.5-flash"
+    
     # Cheap model (fast/cost-effective, for query generation and simple tasks)
     DSPY_CHEAP_MODEL: str = "openrouter/google/gemini-2.5-flash-lite"
     # Alternative cheap options:
@@ -99,6 +105,9 @@ class Settings(BaseSettings):
     LANGFUSE_PUBLIC_KEY: Optional[str] = None
     LANGFUSE_BASE_URL: str = "https://cloud.langfuse.com"
     LANGFUSE_ENABLED: bool = True
+    # Increase OTEL/Langfuse exporter tolerance for slower networks.
+    LANGFUSE_HTTP_TIMEOUT_SECONDS: int = 15
+    LANGFUSE_OTEL_TIMEOUT_MS: int = 15000
 
     # Database Pool Settings
     DB_POOL_SIZE: int = 5

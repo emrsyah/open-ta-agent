@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 
 from app.config import get_settings
 from app.database import get_session_factory, close_db
-from app.api.routes import chat, papers, health
+from app.api.routes import chat, papers, health, agent
 from app.services.rag import init_rag_service
 from app.services.retriever import PaperRetriever
 from app.utils.logging_config import setup_logging
@@ -73,13 +73,23 @@ async def lifespan(app: FastAPI):
             if settings.LANGFUSE_SECRET_KEY:
                 os.environ.setdefault("LANGFUSE_SECRET_KEY", settings.LANGFUSE_SECRET_KEY)
             os.environ.setdefault("LANGFUSE_HOST", settings.LANGFUSE_BASE_URL)
+            # OTEL timeout env values are in milliseconds.
+            os.environ.setdefault(
+                "OTEL_EXPORTER_OTLP_TIMEOUT", str(settings.LANGFUSE_OTEL_TIMEOUT_MS)
+            )
+            os.environ.setdefault(
+                "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+                str(settings.LANGFUSE_OTEL_TIMEOUT_MS),
+            )
 
             # Use the OTEL-based integration (works with Langfuse v3+)
             litellm.callbacks = ["langfuse_otel"]
 
             # Initialize the Langfuse client so @observe decorators work
             from langfuse import Langfuse
-            _langfuse_client = Langfuse()
+            _langfuse_client = Langfuse(
+                timeout=settings.LANGFUSE_HTTP_TIMEOUT_SECONDS
+            )
             logger.info("Langfuse tracing enabled via OTEL integration")
         except Exception as e:
             logger.warning("Failed to initialize Langfuse: %s", e)
@@ -185,6 +195,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(papers.router)
     app.include_router(chat.router)
+    app.include_router(agent.router)
 
     return app
 
