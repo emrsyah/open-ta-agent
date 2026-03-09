@@ -19,6 +19,13 @@ dspy-ai
 langgraph
 langchain-core
 
+# Deep Agents (LangChain)
+deepagents
+langchain-openrouter
+
+# Custom Research Agent (LangChain)
+langchain
+
 # Observability
 langfuse
 
@@ -53,7 +60,6 @@ redis[hiredis]>=5.0.0
 # Additional utilities that may be needed
 python-multipart  # For file uploads (if needed)
 aiofiles  # For async file operations
-
 
 # Authentication
 pyjwt

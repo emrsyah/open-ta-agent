@@ -81,7 +81,7 @@ async def _save_title(
 
 
 @router.post("/basic", response_model=ChatResponse)
-@observe(name="chat-basic")
+@observe(name="chat-basic", capture_output=False)
 async def chat_basic(
     request: ChatRequest,
     background_tasks: BackgroundTasks,
@@ -237,7 +237,7 @@ async def _generate_and_save_title_bg(
 # ------------------------------------------------------------------ #
 
 @router.post("/new", response_model=ChatResponse)
-@observe(name="chat-new-lg")
+@observe(name="chat-new-lg", capture_output=False)
 async def chat_new(
     request: ChatRequest,
     background_tasks: BackgroundTasks,
@@ -393,3 +393,149 @@ async def chat_deep(request: ChatRequest):
         status_code=501,
         detail="Deep research with RLM is not yet implemented. Use /chat/basic for now."
     )
+
+# ------------------------------------------------------------------ #
+# /chat/deepagents — DeepAgents-powered RAG pipeline                   #
+# ------------------------------------------------------------------ #
+
+@router.post("/deepagents", response_model=ChatResponse)
+@observe(name="chat-deepagents", capture_output=False)
+async def chat_deepagents(
+    request: ChatRequest,
+    background_tasks: BackgroundTasks,
+    current_user: str = Depends(get_current_user_required),
+):
+    """DeepAgents-powered AI chat with papers.
+    
+    Uses LangChain's DeepAgents for orchestration with custom tools
+    for paper search and RAG. Supports streaming (SSE) and non-streaming responses.
+    """
+    from app.services.rag_deepagents import get_rag_service_da
+
+    rag_service_da = get_rag_service_da()
+    query = request.get_query()
+    stream = request.get_stream()
+    conversation_id = request.get_conversation_id()
+    user_id = current_user
+    meta_params = request.meta_params
+
+    # Tag this Langfuse trace with useful metadata
+    try:
+        langfuse = get_client()
+        langfuse.update_current_trace(
+            session_id=conversation_id or "anonymous",
+            user_id=user_id or "anonymous",
+            input={"query": query},
+            tags=["chat-deepagents", "deepagents"],
+        )
+    except Exception as exc:
+        logger.debug("Langfuse trace tagging skipped: %s", exc)
+
+    # Load history (same logic as /chat/basic)
+    raw_history = await _load_history(conversation_id, meta_params.is_incognito, user_id)
+    is_first_message = not raw_history
+    if raw_history and len(raw_history) > 5:
+        raw_history = raw_history[-5:]
+
+    if not stream:
+        result = await rag_service_da.chat(
+            query,
+            history=raw_history,
+            language=meta_params.language,
+            source_preference=meta_params.source_preference,
+            catalog_type=meta_params.catalog_type,
+            year_from=meta_params.year_from,
+            year_to=meta_params.year_to,
+            author=meta_params.author,
+            has_electronic_access=meta_params.has_electronic_access,
+        )
+
+        if conversation_id:
+            background_tasks.add_task(
+                _save_history,
+                conversation_id=conversation_id,
+                question=query,
+                answer=result["answer"],
+                sources=[s.model_dump() if hasattr(s, "model_dump") else s for s in result.get("sources", [])],
+                search_query=result.get("search_query"),
+                is_incognito=meta_params.is_incognito,
+                user_id=user_id,
+            )
+            if is_first_message and not meta_params.is_incognito:
+                background_tasks.add_task(
+                    _generate_and_save_title_da_bg,
+                    conversation_id=conversation_id,
+                    question=query,
+                    answer=result["answer"],
+                    user_id=user_id,
+                )
+
+        raw_sources = result.get("sources", [])
+        audit_data = _audit_citations(result["answer"], raw_sources)
+        citation_audit = CitationAudit(**audit_data)
+
+        return ChatResponse(
+            answer=result["answer"],
+            sources=raw_sources,
+            context=result.get("rationale"),
+            search_query=result.get("search_query"),
+            citation_audit=citation_audit,
+        )
+
+    # ── Streaming path (DeepAgents) ───────────────────────────────────
+    async def _on_complete_da(answer: str, sources: list, search_query: str | None) -> None:
+        if conversation_id:
+            await _save_history(
+                conversation_id=conversation_id,
+                question=query,
+                answer=answer,
+                sources=sources,
+                search_query=search_query,
+                is_incognito=meta_params.is_incognito,
+                user_id=user_id,
+            )
+
+    async def _title_generator_da(question: str, answer: str) -> str:
+        title = await rag_service_da.generate_title(question, answer)
+        if conversation_id and not meta_params.is_incognito:
+            await _save_title(conversation_id, title, user_id)
+        return title
+
+    return StreamingResponse(
+        rag_service_da.stream_response(
+            question=query,
+            history=raw_history,
+            language=meta_params.language,
+            source_preference=meta_params.source_preference,
+            catalog_type=meta_params.catalog_type,
+            year_from=meta_params.year_from,
+            year_to=meta_params.year_to,
+            author=meta_params.author,
+            has_electronic_access=meta_params.has_electronic_access,
+            conversation_id=conversation_id,
+            is_incognito=meta_params.is_incognito,
+            user_id=user_id,
+            on_complete=_on_complete_da,
+            generate_title_fn=_title_generator_da if is_first_message and not meta_params.is_incognito else None,
+            is_first_message=is_first_message,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _generate_and_save_title_da_bg(
+    conversation_id: str, question: str, answer: str, user_id: str | None = None
+) -> None:
+    """Background task: generate title via DeepAgents service and save it."""
+    try:
+        from app.services.rag_deepagents import get_rag_service_da
+        title = await get_rag_service_da().generate_title(question, answer)
+        await _save_title(conversation_id, title, user_id)
+    except Exception as e:
+        logger.warning("[CHAT-DA] Background title generation failed for %s: %s", conversation_id, e)
+
