@@ -3,6 +3,12 @@ Application configuration and settings.
 Uses pydantic-settings for environment variable management.
 """
 
+import os
+from dotenv import load_dotenv
+
+# Load env vars into os.environ for dependencies (e.g. LangChain, Redis)
+load_dotenv()
+
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 from typing import Optional, List
